@@ -2381,8 +2381,8 @@ struct Present {
   Present(Device& device, Swapchain& swapchain)
     : device(&device), swapchain(&swapchain) {}
 
-  vk::Queue  graphics_queue;
-  vk::Queue  present_queue;
+  vk::Queue graphics_queue;
+  vk::Queue present_queue;
 
   vk::CommandPool                command_pool;
   std::vector<vk::CommandBuffer> command_buffers;
@@ -2491,14 +2491,15 @@ struct Present {
     vk::PipelineStageFlags wait_stages[]     = {vk::PipelineStageFlagBits::eColorAttachmentOutput};
 
     vk::SubmitInfo submitInfo;
-    submitInfo.waitSemaphoreCount          = 1;
-    submitInfo.pWaitSemaphores             = wait_semaphores;
-    submitInfo.pWaitDstStageMask           = wait_stages;
+    submitInfo.waitSemaphoreCount = 1;
+    submitInfo.pWaitSemaphores    = wait_semaphores;
+    submitInfo.pWaitDstStageMask  = wait_stages;
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers    = &getCurrentCommandBuffer();
-    vk::Semaphore signal_semaphores[] = {getFinishedSemaphore()};
-    submitInfo.signalSemaphoreCount = 1;
-    submitInfo.pSignalSemaphores    = signal_semaphores;
+
+    vk::Semaphore signal_semaphores[] = { getFinishedSemaphore() };
+    submitInfo.signalSemaphoreCount   = 1;
+    submitInfo.pSignalSemaphores      = signal_semaphores;
 
     dev->resetFences(1, &getInFlightFence());
     graphics_queue.submit(1, &submitInfo, getInFlightFence());
@@ -2811,7 +2812,6 @@ struct GenericBuffer {
   {
     this->size = size;
     this->device = &device;
-
     // Create the buffer object without memory.
     vk::BufferCreateInfo ci{};
     ci.size = size;
@@ -2880,7 +2880,7 @@ struct GenericBuffer {
   void updateLocal(const void *value, vk::DeviceSize size) const {
     void *ptr = (*device)->mapMemory(memory, 0, size, vk::MemoryMapFlags{});
     memcpy(ptr, value, (size_t)size);
-    flush();
+    // flush();
     (*device)->unmapMemory(memory);
   }
 
@@ -2955,7 +2955,7 @@ struct IndexBuffer : public GenericBuffer {
 struct HostIndexBuffer : public GenericBuffer {
   HostIndexBuffer() {}
   template<class Type, class Allocator = std::allocator<Type> >
-  HostIndexBuffer(vkb::Device& device, const std::vector<Type, Allocator> &value) \
+  HostIndexBuffer(vkb::Device& device, const std::vector<Type, Allocator> &value) 
     : GenericBuffer(device, vk::BufferUsageFlagBits::eIndexBuffer, value.size() * sizeof(Type), vk::MemoryPropertyFlagBits::eHostVisible) {
     updateLocal(device, value);
   }
@@ -3195,8 +3195,7 @@ protected:
 /// A 2D texture image living on the GPU or a staging buffer visible to the CPU.
 class TextureImage2D : public GenericImage {
 public:
-  TextureImage2D() {
-  }
+  TextureImage2D() {}
 
   TextureImage2D(Device& device, uint32_t width, uint32_t height, uint32_t mipLevels=1, vk::Format format = vk::Format::eR8G8B8A8Unorm, bool hostImage = false) {
     vk::ImageCreateInfo info;
@@ -3221,8 +3220,7 @@ private:
 /// A cube map texture image living on the GPU or a staging buffer visible to the CPU.
 class TextureImageCube : public GenericImage {
 public:
-  TextureImageCube() {
-  }
+  TextureImageCube() {}
 
   TextureImageCube(Device& device, const vk::PhysicalDeviceMemoryProperties &memprops, uint32_t width, uint32_t height, uint32_t mipLevels=1, vk::Format format = vk::Format::eR8G8B8A8Unorm, bool hostImage = false) {
     vk::ImageCreateInfo info;
@@ -3275,8 +3273,7 @@ private:
 /// An image to use as a colour buffer on a renderpass.
 class ColorAttachmentImage : public GenericImage {
 public:
-  ColorAttachmentImage() {
-  }
+  ColorAttachmentImage() {}
 
   ColorAttachmentImage(Device& device, uint32_t width, uint32_t height, vk::Format format = vk::Format::eR8G8B8A8Unorm) {
     vk::ImageCreateInfo info;
@@ -3541,8 +3538,7 @@ private:
 class DescriptorSetBuilder {
 public:
   // Construct a new, empty DescriptorSetBuilder.
-  DescriptorSetBuilder() {
-  }
+  DescriptorSetBuilder() {}
 
   /// Add another layout describing a descriptor set.
   DescriptorSetBuilder &layout(vk::DescriptorSetLayout layout) {

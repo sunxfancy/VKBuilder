@@ -108,7 +108,7 @@ public:
   }
 
   void initVertex() {
-    v.reserve(3);
+    v.resize(3);
     v[0].pos = {0, 0.5}; v[0].color = {1,0,0};
     v[1].pos = {-0.5, -0.5}; v[1].color = {0,1,0};
     v[2].pos = {0.5, -0.5}; v[2].color = {0,0,1};
@@ -120,9 +120,11 @@ public:
   void render() {
     present.begin();
     present.beginRenderPass(renderpass);
+
+    vk::DeviceSize offset(0);
     auto& cb = present.getCurrentCommandBuffer();
     cb.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
-    cb.bindVertexBuffers(0, 1, &buffer.buffer, vk::DeviceSize(0));
+    cb.bindVertexBuffers(0, 1, &buffer.buffer, &offset);
     cb.draw(3, 1, 0, 0);
 
     present.endRenderPass();
