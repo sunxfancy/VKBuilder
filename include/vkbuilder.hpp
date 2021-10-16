@@ -3250,7 +3250,6 @@ public:
     info.initialLayout = vk::ImageLayout::ePreinitialized;
     create(device, info, vk::ImageViewType::eCube, vk::ImageAspectFlagBits::eColor, hostImage);
   }
-private:
 };
 
 /// An image to use as a depth buffer on a renderpass.
@@ -3277,7 +3276,6 @@ public:
     typedef vk::ImageAspectFlagBits iafb;
     create(device, info, vk::ImageViewType::e2D, iafb::eDepth, false);
   }
-private:
 };
 
 /// An image to use as a colour buffer on a renderpass.
@@ -3304,7 +3302,6 @@ public:
     typedef vk::ImageAspectFlagBits iafb;
     create(device, info, vk::ImageViewType::e2D, iafb::eColor, false);
   }
-private:
 };
 
 /// A class to help build samplers.
