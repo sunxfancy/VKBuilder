@@ -49,7 +49,7 @@ class Render {
 public:
   void init(void *window) {
     vkb::InstanceBuilder builder;
-    inst = builder.require_api_version(1, 2)
+    inst = builder.require_api_version(1, 0)
                   .request_validation_layers()   // validate correctness
                   .use_default_debug_messenger() // use DebugUtilsMessage
                   .build();
@@ -59,8 +59,7 @@ public:
     vkb::PhysicalDeviceSelector selector{inst};
 
     auto phys = selector.set_surface(surface)
-            .set_minimum_version(1, 2) // require a vulkan 1.2 capable device
-            .require_dedicated_transfer_queue()
+            .set_minimum_version(1, 0) // require a vulkan 1.0 capable device
             .select();
 
     vkb::DeviceBuilder device_builder{phys};

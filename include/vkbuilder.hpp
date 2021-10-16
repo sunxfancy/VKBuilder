@@ -1534,7 +1534,7 @@ struct Swapchain : Agent<vk::SwapchainKHR> {
 
 class SwapchainBuilder {
 public:
-  explicit SwapchainBuilder(Device const &device) {
+  explicit SwapchainBuilder(Device &device) {
     info.device = device;
     info.physical_device = device.physical_device;
     info.surface = device.surface;
@@ -1545,7 +1545,7 @@ public:
     info.present_queue_index = graphics;
     info.allocation_callbacks = device.allocation_callbacks;
   }
-  explicit SwapchainBuilder(Device const &device,
+  explicit SwapchainBuilder(Device &device,
                             vk::SurfaceKHR const surface) {
     info.device = device;
     info.physical_device = device.physical_device;
@@ -1669,7 +1669,7 @@ public:
     info.old_swapchain = old_swapchain;
     return *this;
   }
-  SwapchainBuilder &set_old_swapchain(Swapchain const &swapchain) {
+  SwapchainBuilder &set_old_swapchain(Swapchain &swapchain) {
     info.old_swapchain = swapchain;
     return *this;
   }
