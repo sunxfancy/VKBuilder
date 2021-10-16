@@ -50,9 +50,9 @@ public:
   void init(void *window) {
     vkb::InstanceBuilder builder;
     inst = builder.require_api_version(1, 2)
-               .request_validation_layers()   // validate correctness
-               .use_default_debug_messenger() // use DebugUtilsMessage
-               .build();
+                  .request_validation_layers()   // validate correctness
+                  .use_default_debug_messenger() // use DebugUtilsMessage
+                  .build();
 
     auto surface = (VkSurfaceKHR)create_surface_glfw(inst.instance, window);
 
@@ -124,7 +124,7 @@ public:
     vk::DeviceSize offset(0);
     auto& cb = present.getCurrentCommandBuffer();
     cb.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
-    cb.bindVertexBuffers(0, 1, &buffer.buffer, &offset);
+    cb.bindVertexBuffers(0, 1, buffer, &offset);
     cb.draw(3, 1, 0, 0);
 
     present.endRenderPass();

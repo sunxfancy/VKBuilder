@@ -2011,12 +2011,12 @@ private:
 };
 
 
-SubpassBuilder& SubpassBuilder::addAttachmentRef(int index, vk::ImageLayout layout) {
+inline SubpassBuilder& SubpassBuilder::addAttachmentRef(int index, vk::ImageLayout layout) {
   idx.push_back(index);
   layouts.push_back(layout);
   return *this;
 }
-vk::SubpassDescription SubpassBuilder::build(RenderPassBuilder& rpb, std::vector<vk::AttachmentReference>& refs) {
+inline vk::SubpassDescription SubpassBuilder::build(RenderPassBuilder& rpb, std::vector<vk::AttachmentReference>& refs) {
   for (int i = 0; i < idx.size(); ++i) {
     vk::AttachmentReference ar;
     ar.attachment = idx[i];
@@ -2844,8 +2844,6 @@ struct GenericBuffer {
     return -1;
   }
 
-  
-
   /// For a purely device local buffer, copy memory to the buffer object immediately.
   /// Note that this will stall the pipeline!
   void upload(vk::CommandPool commandPool, vk::Queue queue, const void *value, vk::DeviceSize size) const {
@@ -2905,6 +2903,14 @@ struct GenericBuffer {
   void invalidate() const {
     vk::MappedMemoryRange mr{memory, 0, VK_WHOLE_SIZE};
     return (*device)->invalidateMappedMemoryRanges(mr);
+  }
+
+  operator vk::Buffer* () {
+    return &buffer;
+  }
+
+  operator vk::Buffer& () {
+    return buffer;
   }
 };
 
@@ -3009,14 +3015,14 @@ public:
   }
 
   /// Update the image with an array of pixels. (Currently 2D only)
-  void update(vk::Device device, const void *data, vk::DeviceSize bytesPerPixel) {
+  void update(const void *data, vk::DeviceSize bytesPerPixel) {
     const uint8_t *src = (const uint8_t *)data;
     for (uint32_t mipLevel = 0; mipLevel != info().mipLevels; ++mipLevel) {
       // Array images are layed out horizontally. eg. [left][front][right] etc.
       for (uint32_t arrayLayer = 0; arrayLayer != info().arrayLayers; ++arrayLayer) {
         vk::ImageSubresource subresource{vk::ImageAspectFlagBits::eColor, mipLevel, arrayLayer};
-        auto srlayout = device.getImageSubresourceLayout(*s.image, subresource);
-        uint8_t *dest = (uint8_t *)device.mapMemory(*s.mem, 0, s.size, vk::MemoryMapFlags{}) + srlayout.offset;
+        auto srlayout = (*device)->getImageSubresourceLayout(*s.image, subresource);
+        uint8_t *dest = (uint8_t *)(*device)->mapMemory(*s.mem, 0, s.size, vk::MemoryMapFlags{}) + srlayout.offset;
         size_t bytesPerLine = s.info.extent.width * bytesPerPixel;
         size_t srcStride = bytesPerLine * info().arrayLayers;
         for (int y = 0; y != s.info.extent.height; ++y) {
@@ -3026,7 +3032,7 @@ public:
         }
       }
     }
-    device.unmapMemory(*s.mem);
+    (*device)->unmapMemory(*s.mem);
   }
 
   /// Copy another image to this one. This also changes the layout.
@@ -3056,9 +3062,13 @@ public:
     cb.copyBufferToImage(buffer, *s.image, vk::ImageLayout::eTransferDstOptimal, region);
   }
 
-  void upload(vk::CommandPool commandPool, vk::Queue queue, std::vector<uint8_t> &bytes) {
-    GenericBuffer stagingBuffer(*device, (vk::BufferUsageFlags)vk::BufferUsageFlagBits::eTransferSrc, (vk::DeviceSize)bytes.size(), vk::MemoryPropertyFlagBits::eHostVisible);
-    stagingBuffer.updateLocal((const void*)bytes.data(), bytes.size());
+  void upload(vk::CommandPool commandPool, vk::Queue queue, const std::vector<uint8_t> &bytes) {
+    upload(commandPool, queue, bytes.data(), bytes.size());
+  }
+
+  void upload(vk::CommandPool commandPool, vk::Queue queue, const void *data, vk::DeviceSize sizeInBytes) {
+    GenericBuffer stagingBuffer(*device, (vk::BufferUsageFlags)vk::BufferUsageFlagBits::eTransferSrc, sizeInBytes, vk::MemoryPropertyFlagBits::eHostVisible);
+    stagingBuffer.updateLocal(data, sizeInBytes);
 
     // Copy the staging buffer to the GPU texture and set the layout.
     executeImmediately(device->instance, commandPool, queue, [&](vk::CommandBuffer cb) {

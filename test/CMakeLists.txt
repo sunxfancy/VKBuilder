@@ -1,6 +1,4 @@
-
-
-
+enable_testing()
 if (WIN32) 
     set(GLFW_FOLDER "win32")
     set(SYS_LIB "")
