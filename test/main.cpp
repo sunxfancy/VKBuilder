@@ -1,12 +1,14 @@
+#define VKB_IMPL
+#include "vkbuilder.hpp"
+
 #include "window.hpp"
+#include "glm/glm.hpp"
+
 #include <iostream>
 #include <fstream>
 #include <vector>
 #include <string>
 #include <cstdint>
-#include "glm/glm.hpp"
-#define VKB_IMPL
-#include "vkbuilder.hpp"
 
 struct Vertex {
   glm::vec2 pos;

@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 #include <deque>
+#include <functional>
+#include <stdexcept>
 
 namespace vkb {
 
@@ -2114,7 +2116,10 @@ public:
     pipeline_info.renderPass          = render_pass;
     pipeline_info.subpass             = subpass;
 
-    return device->createGraphicsPipeline(nullptr, pipeline_info);
+    auto result = device->createGraphicsPipeline(nullptr, pipeline_info);
+    if (result.result != vk::Result::eSuccess)
+      throw std::runtime_error("failed_create_graphics_pipeline");
+    return result.value;
   }
 
   PipelineBuilder& useClassicPipeline(const std::vector<uint32_t>& vert, const std::vector<uint32_t>& frag) {
@@ -2477,8 +2482,7 @@ struct Present {
       recreate_swapchain();
       return;
     } else if (result != vk::Result::eSuccess && result != vk::Result::eSuboptimalKHR) {
-      std::cout << "failed to acquire swapchain image. Error " << result << "\n";
-      return;
+      throw std::runtime_error("failed to acquire swapchain image.");
     }
 
     if (getImageInFlight(image_index)) {
@@ -2519,8 +2523,7 @@ struct Present {
          || result == vk::Result::eSuboptimalKHR) {
       recreate_swapchain();
     } else if (result != vk::Result::eSuccess) {
-      std::cout << "failed to present swapchain image\n";
-      return;
+      throw std::runtime_error("failed to present swapchain image");
     }
     swapchain->current_frame = (swapchain->current_frame + 1) % swapchain->image_count;
   }
