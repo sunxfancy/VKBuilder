@@ -10,6 +10,14 @@
 #include <functional>
 #include <stdexcept>
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+#include <dlfcn.h>
+#define VKB_LOAD_FROM_PROCESS 1
+#endif
+#endif
+
 namespace vkb {
 
 // Agent template for adding a default object for vkb::Instance/Device...
@@ -246,8 +254,17 @@ class InstanceBuilder {
 public:
   static bool loaded;
   static void loadDefault() {
+#ifdef VKB_LOAD_FROM_PROCESS
+    // iOS has no libvulkan.dylib to dlopen: MoltenVK is an embedded framework
+    // linked into the app, so its symbols are already in the process.
+    auto vkGetInstanceProcAddr =
+        reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(RTLD_DEFAULT, "vkGetInstanceProcAddr"));
+    if (vkGetInstanceProcAddr == nullptr)
+      throw std::runtime_error("Failed to locate vkGetInstanceProcAddr (MoltenVK not loaded)");
+#else
     vk::DynamicLoader dl;
     PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr = dl.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr");
+#endif
     VULKAN_HPP_DEFAULT_DISPATCHER.init(vkGetInstanceProcAddr);
   }
 
