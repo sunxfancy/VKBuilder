@@ -191,10 +191,11 @@ static inline bool check_add_window_ext(const char *name,
 };
 
 static inline std::vector<const char *>
-strvec2c_str(std::vector<std::string> strvec) {
+strvec2c_str(std::vector<std::string> const &strvec) {
   std::vector<const char *> result;
-  for (auto s : strvec) {
-    result.push_back(s.data());
+  result.reserve(strvec.size());
+  for (auto const &s : strvec) {
+    result.push_back(s.c_str());
   }
   return result;
 }
@@ -453,6 +454,12 @@ public:
   // extension isn't available.
   InstanceBuilder &enable_extension(std::string extension_name) {
     extensions.push_back(extension_name);
+    return *this;
+  }
+
+  // Adds instance creation flags (e.g. EnumeratePortabilityKHR for MoltenVK).
+  InstanceBuilder &add_flags(vk::InstanceCreateFlags create_flags) {
+    flags |= create_flags;
     return *this;
   }
 
