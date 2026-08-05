@@ -1508,7 +1508,8 @@ struct Swapchain : Agent<vk::SwapchainKHR> {
     }
   }
 
-  std::vector<vk::Framebuffer> createFramebuffers(vk::RenderPass render_pass) {
+  std::vector<vk::Framebuffer> createFramebuffers(vk::RenderPass render_pass,
+                                                   vk::ImageView depth_view = {}) {
     auto& image_views = get_image_views();
     if (image_views.empty())
       throw std::runtime_error("cannot get swapchain image views");
@@ -1516,12 +1517,11 @@ struct Swapchain : Agent<vk::SwapchainKHR> {
     std::vector<vk::Framebuffer> swapchain_framebuffers(image_views.size());
 
     for (size_t i = 0; i < image_views.size(); i++) {
-      vk::ImageView attachments[] = {image_views[i]};
+      vk::ImageView attachments[2] = {image_views[i], depth_view};
 
-      // TODO: Add more configuration for framebuffer
       vk::FramebufferCreateInfo framebuffer_info = {};
       framebuffer_info.renderPass              = render_pass;
-      framebuffer_info.attachmentCount         = 1;
+      framebuffer_info.attachmentCount         = depth_view ? 2u : 1u;
       framebuffer_info.pAttachments            = attachments;
       framebuffer_info.width                   = extent.width;
       framebuffer_info.height                  = extent.height;
@@ -1916,10 +1916,19 @@ class RenderPassBuilder;
 class SubpassBuilder {
 public:
   SubpassBuilder& addAttachmentRef(int index, vk::ImageLayout layout);
+  SubpassBuilder& setDepthStencilAttachment(int index, vk::ImageLayout layout) {
+    hasDepth = true;
+    depthIdx = index;
+    depthLayout = layout;
+    return *this;
+  }
   vk::SubpassDescription build(RenderPassBuilder& rpb, std::vector<vk::AttachmentReference>& refs);
 protected:
   std::vector<int> idx;
   std::vector<vk::ImageLayout> layouts;
+  bool hasDepth = false;
+  int depthIdx = -1;
+  vk::ImageLayout depthLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal;
 };
 
 class RenderPassBuilder {
@@ -1979,6 +1988,24 @@ public:
     return *this;
   }
 
+  RenderPassBuilder& addDepthAttachment(vk::Format image_format,
+    vk::AttachmentLoadOp loadOp = vk::AttachmentLoadOp::eClear,
+    vk::AttachmentStoreOp storeOp = vk::AttachmentStoreOp::eDontCare
+  ) {
+    attachments.push_back(
+      vk::AttachmentDescription()
+        .setFormat(image_format)
+        .setSamples(vk::SampleCountFlagBits::e1)
+        .setLoadOp(loadOp)
+        .setStoreOp(storeOp)
+        .setStencilLoadOp(vk::AttachmentLoadOp::eDontCare)
+        .setStencilStoreOp(vk::AttachmentStoreOp::eDontCare)
+        .setInitialLayout(vk::ImageLayout::eUndefined)
+        .setFinalLayout(vk::ImageLayout::eDepthStencilAttachmentOptimal)
+    );
+    return *this;
+  }
+
   RenderPassBuilder& addSubpass(const vk::SubpassDescription& sd) {
     subpass.push_back(sd);
     return *this;
@@ -2008,6 +2035,7 @@ private:
   std::vector<vk::AttachmentDescription> attachments;
   std::vector<vk::SubpassDescription> subpass;
   std::vector<std::vector<vk::AttachmentReference> > refs;
+  std::vector<vk::AttachmentReference> depthRefs;
   std::vector<vk::SubpassDependency> dependencies;
 };
 
@@ -2029,6 +2057,11 @@ inline vk::SubpassDescription SubpassBuilder::build(RenderPassBuilder& rpb, std:
   sd.pipelineBindPoint = vk::PipelineBindPoint::eGraphics;
   sd.colorAttachmentCount = refs.size();
   sd.pColorAttachments = refs.data();
+  if (hasDepth) {
+    rpb.depthRefs.push_back(
+        vk::AttachmentReference{uint32_t(depthIdx), depthLayout});
+    sd.pDepthStencilAttachment = &rpb.depthRefs.back();
+  }
   return sd;
 }
 
@@ -2110,6 +2143,7 @@ public:
     pipeline_info.pViewportState      = &viewport_state;
     pipeline_info.pRasterizationState = &rasterizer;
     pipeline_info.pMultisampleState   = &multisampling;
+    pipeline_info.pDepthStencilState  = &depth_stencil;
     pipeline_info.pColorBlendState    = &color_blending;
     pipeline_info.pDynamicState       = &dynamic_info;
     pipeline_info.layout              = layout;
@@ -2366,6 +2400,8 @@ private:
   bool use_default_multisampling = true;
   vk::PipelineMultisampleStateCreateInfo multisampling;
 
+  vk::PipelineDepthStencilStateCreateInfo depth_stencil{};
+
   bool use_default_color_blending = true;
   vk::PipelineColorBlendAttachmentState colorBlendAttachment;
   vk::PipelineColorBlendStateCreateInfo color_blending;
@@ -2398,6 +2434,7 @@ struct Present {
   std::vector<vk::Semaphore> available_semaphores;
   std::vector<vk::Semaphore> finished_semaphore;
   vk::RenderPass render_pass;
+  vk::ImageView depth_attachment{};
 
   vk::CommandBuffer& getCurrentCommandBuffer() {
     return command_buffers[swapchain->current_frame];
@@ -2418,17 +2455,23 @@ struct Present {
     buffer.end();
   }
 
-  void beginRenderPass(vk::RenderPass render_pass, 
-    vk::ClearValue clearColor = vk::ClearColorValue(std::array<float, 4>{0.0f, 0.0f, 0.0f, 1.0f})) {    
+  void beginRenderPass(vk::RenderPass render_pass,
+                       const vk::ClearValue *clearValues,
+                       uint32_t clearCount) {
     this->render_pass = render_pass;
     vk::RenderPassBeginInfo render_pass_info = {};
     render_pass_info.renderPass            = render_pass;
     render_pass_info.framebuffer           = getCurrentFrameBuffer();
     render_pass_info.renderArea.offset     = vk::Offset2D{0, 0};
     render_pass_info.renderArea.extent     = swapchain->extent;
-    render_pass_info.clearValueCount       = 1;
-    render_pass_info.pClearValues          = &clearColor;
+    render_pass_info.clearValueCount       = clearCount;
+    render_pass_info.pClearValues          = clearValues;
     getCurrentCommandBuffer().beginRenderPass(render_pass_info, vk::SubpassContents::eInline);
+  }
+
+  void beginRenderPass(vk::RenderPass render_pass, 
+    vk::ClearValue clearColor = vk::ClearColorValue(std::array<float, 4>{0.0f, 0.0f, 0.0f, 1.0f})) {    
+    beginRenderPass(render_pass, &clearColor, 1);
   }
 
   void endRenderPass() {
@@ -2465,7 +2508,7 @@ struct Present {
 
     swapchain->destroy_imageviews();
     create_swapchain();
-    framebuffers = swapchain->createFramebuffers(this->render_pass);
+    framebuffers = swapchain->createFramebuffers(this->render_pass, depth_attachment);
     command_pool = device->createCommandPool();
     command_buffers = device->createCommandBuffers(
                          command_pool, swapchain->image_count);
@@ -2536,12 +2579,13 @@ public:
     : device(device), swapchain(swapchain) {}
   virtual ~PresentBuilder() {}
 
-  Present build(vk::RenderPass render_pass) {
+  Present build(vk::RenderPass render_pass, vk::ImageView depth_view = {}) {
     Present cb{device, swapchain};
     cb.command_pool = device.createCommandPool();
     cb.command_buffers = device.createCommandBuffers(
                          cb.command_pool, swapchain.image_count);
-    cb.framebuffers = swapchain.createFramebuffers(render_pass);
+    cb.depth_attachment = depth_view;
+    cb.framebuffers = swapchain.createFramebuffers(render_pass, depth_view);
 
     cb.in_flight_fences = device.createFences(swapchain.image_count);
     cb.image_in_flight = device.createFences(swapchain.image_count);
@@ -3259,7 +3303,7 @@ class DepthStencilImage : public GenericImage {
 public:
   DepthStencilImage() {}
 
-  DepthStencilImage(Device& device, uint32_t width, uint32_t height, vk::Format format = vk::Format::eD24UnormS8Uint) {
+  DepthStencilImage(Device& device, uint32_t width, uint32_t height, vk::Format format = vk::Format::eD32Sfloat) {
     vk::ImageCreateInfo info;
     info.flags = {};
 
