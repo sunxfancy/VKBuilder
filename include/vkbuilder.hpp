@@ -2445,6 +2445,10 @@ struct Present {
   uint32_t last_presented_image_index = 0;
   uint32_t acquired_image_index = 0;
   bool has_acquired_image = false;
+  // Set when acquire/present reports the swapchain is out-of-date/suboptimal.
+  // The owner is responsible for recreating the swapchain at a safe time
+  // (important on Android, where recreating mid-rotation crashes the driver).
+  bool needs_recreate = false;
   // Invoked after GPU idle post-submit, before presentKHR.
   std::function<void(uint32_t renderedImageIndex)> after_render_before_present;
 
@@ -2466,9 +2470,11 @@ struct Present {
     vk::Result result = dev->acquireNextImageKHR(
         *swapchain, UINT64_MAX, getAvailableSemaphore(), vk::Fence{}, &acquired_image_index);
     if (result == vk::Result::eErrorOutOfDateKHR) {
-      recreate_swapchain();
-      result = dev->acquireNextImageKHR(
-          *swapchain, UINT64_MAX, getAvailableSemaphore(), vk::Fence{}, &acquired_image_index);
+      // Defer swapchain recreation to the owner instead of rebuilding inline.
+      // On Android the surface can be mid-rotation here, and rebuilding the
+      // swapchain/image-views against a not-ready surface crashes the driver.
+      needs_recreate = true;
+      return;
     }
     if (result != vk::Result::eSuccess && result != vk::Result::eSuboptimalKHR)
       throw std::runtime_error("failed to acquire swapchain image.");
@@ -2552,6 +2558,10 @@ struct Present {
     auto dev = *device;
     if (!has_acquired_image)
       acquireForFrame();
+    // Acquire failed with out-of-date (e.g. Android rotation/resume). Skip the
+    // frame; the owner recreates the swapchain at a safe point.
+    if (!has_acquired_image)
+      return;
 
     if (getImageInFlight(acquired_image_index)) {
       (void)dev->waitForFences(1, &getImageInFlight(acquired_image_index), VK_TRUE, UINT64_MAX);
@@ -2594,7 +2604,8 @@ struct Present {
     has_acquired_image = false;
     if (result == vk::Result::eErrorOutOfDateKHR
          || result == vk::Result::eSuboptimalKHR) {
-      recreate_swapchain();
+      // Defer to the owner (see acquireForFrame) rather than rebuilding inline.
+      needs_recreate = true;
     } else if (result != vk::Result::eSuccess) {
       throw std::runtime_error("failed to present swapchain image");
     }
