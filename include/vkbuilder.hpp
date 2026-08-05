@@ -2435,16 +2435,41 @@ struct Present {
   std::vector<vk::Semaphore> finished_semaphore;
   vk::RenderPass render_pass;
   vk::ImageView depth_attachment{};
+  uint32_t last_presented_image_index = 0;
+  uint32_t acquired_image_index = 0;
+  bool has_acquired_image = false;
+  // Invoked after GPU idle post-submit, before presentKHR.
+  std::function<void(uint32_t renderedImageIndex)> after_render_before_present;
 
   vk::CommandBuffer& getCurrentCommandBuffer() {
     return command_buffers[swapchain->current_frame];
   }
 
   vk::Framebuffer& getCurrentFrameBuffer() {
-    return framebuffers[swapchain->current_frame];
+    uint32_t idx = has_acquired_image ? acquired_image_index
+                                      : static_cast<uint32_t>(swapchain->current_frame);
+    return framebuffers[idx];
+  }
+
+  void acquireForFrame() {
+    if (has_acquired_image) return;
+    auto dev = *device;
+    (void)dev->waitForFences(1, &getInFlightFence(), VK_TRUE, UINT64_MAX);
+
+    vk::Result result = dev->acquireNextImageKHR(
+        *swapchain, UINT64_MAX, getAvailableSemaphore(), vk::Fence{}, &acquired_image_index);
+    if (result == vk::Result::eErrorOutOfDateKHR) {
+      recreate_swapchain();
+      result = dev->acquireNextImageKHR(
+          *swapchain, UINT64_MAX, getAvailableSemaphore(), vk::Fence{}, &acquired_image_index);
+    }
+    if (result != vk::Result::eSuccess && result != vk::Result::eSuboptimalKHR)
+      throw std::runtime_error("failed to acquire swapchain image.");
+    has_acquired_image = true;
   }
 
   void begin() {
+    acquireForFrame();
     vk::CommandBufferBeginInfo begin_info;
     auto buffer = getCurrentCommandBuffer();
     buffer.reset();
@@ -2513,26 +2538,18 @@ struct Present {
     command_pool = device->createCommandPool();
     command_buffers = device->createCommandBuffers(
                          command_pool, swapchain->image_count);
+    has_acquired_image = false;
   }
 
   void drawFrame() {
     auto dev = *device;
-    dev->waitForFences(1, &getInFlightFence(), true, UINT64_MAX);
+    if (!has_acquired_image)
+      acquireForFrame();
 
-    uint32_t image_index = 0;
-    vk::Result result = dev->acquireNextImageKHR(*swapchain, UINT64_MAX,
-                        getAvailableSemaphore(), vk::Fence(), &image_index);
-    if (result == vk::Result::eErrorOutOfDateKHR) {
-      recreate_swapchain();
-      return;
-    } else if (result != vk::Result::eSuccess && result != vk::Result::eSuboptimalKHR) {
-      throw std::runtime_error("failed to acquire swapchain image.");
+    if (getImageInFlight(acquired_image_index)) {
+      (void)dev->waitForFences(1, &getImageInFlight(acquired_image_index), VK_TRUE, UINT64_MAX);
     }
-
-    if (getImageInFlight(image_index)) {
-        dev->waitForFences(1, &getImageInFlight(image_index), true, UINT64_MAX);
-    }
-    getImageInFlight(image_index) = getInFlightFence();
+    getImageInFlight(acquired_image_index) = getInFlightFence();
 
     vk::Semaphore          wait_semaphores[] = { getAvailableSemaphore() };
     vk::PipelineStageFlags wait_stages[]     = {vk::PipelineStageFlagBits::eColorAttachmentOutput};
@@ -2548,10 +2565,14 @@ struct Present {
     submitInfo.signalSemaphoreCount   = 1;
     submitInfo.pSignalSemaphores      = signal_semaphores;
 
-    dev->resetFences(1, &getInFlightFence());
+    (void)dev->resetFences(1, &getInFlightFence());
     graphics_queue.submit(1, &submitInfo, getInFlightFence());
 
-    dev->waitIdle();
+    (void)dev->waitIdle();
+
+    last_presented_image_index = acquired_image_index;
+    if (after_render_before_present)
+      after_render_before_present(last_presented_image_index);
 
     vk::PresentInfoKHR present_info = {};
     present_info.waitSemaphoreCount = 1;
@@ -2560,16 +2581,18 @@ struct Present {
     vk::SwapchainKHR swapChains[] = {swapchain->instance};
     present_info.swapchainCount   = 1;
     present_info.pSwapchains      = swapChains;
-    present_info.pImageIndices    = &image_index;
+    present_info.pImageIndices    = &acquired_image_index;
 
-    result = present_queue.presentKHR(&present_info);
-    if (result == vk::Result::eErrorOutOfDateKHR 
+    vk::Result result = present_queue.presentKHR(&present_info);
+    has_acquired_image = false;
+    if (result == vk::Result::eErrorOutOfDateKHR
          || result == vk::Result::eSuboptimalKHR) {
       recreate_swapchain();
     } else if (result != vk::Result::eSuccess) {
       throw std::runtime_error("failed to present swapchain image");
     }
-    swapchain->current_frame = (swapchain->current_frame + 1) % swapchain->image_count;
+    if (swapchain->image_count > 0)
+      swapchain->current_frame = (swapchain->current_frame + 1) % swapchain->image_count;
   }
 };
 
