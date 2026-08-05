@@ -2447,6 +2447,7 @@ struct Present {
   void begin() {
     vk::CommandBufferBeginInfo begin_info;
     auto buffer = getCurrentCommandBuffer();
+    buffer.reset();
     buffer.begin(begin_info);
   }
 
