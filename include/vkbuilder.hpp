@@ -2500,6 +2500,10 @@ struct Present {
 
   void begin() {
     acquireForFrame();
+    // If acquire failed (out-of-date surface), do not begin recording — the
+    // owner recreates the swapchain and retries. Beginning here would leave a
+    // CB in recording state with no valid framebuffer target.
+    if (!has_acquired_image) return;
     vk::CommandBufferBeginInfo begin_info;
     auto buffer = getCurrentCommandBuffer();
     buffer.reset();
