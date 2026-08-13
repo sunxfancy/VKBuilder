@@ -2466,7 +2466,22 @@ struct Present {
   // The owner is responsible for recreating the swapchain at a safe time
   // (important on Android, where recreating mid-rotation crashes the driver).
   bool needs_recreate = false;
-  // Invoked after GPU idle post-submit, before presentKHR.
+  // When true (legacy default), drawFrame() blocks on this frame's fence
+  // before presenting, so callers may free per-frame GPU resources (vertex
+  // buffers etc.) as soon as drawFrame() returns.
+  // Set to false for real frames-in-flight: drawFrame() submits and presents
+  // without waiting; the only stall is the per-slot fence wait in
+  // acquireForFrame(). Callers must then keep per-frame resources alive until
+  // that slot's fence has signaled (see waitForFrameSlot / waitForAllFrames).
+  bool synchronous_frames = true;
+  // Independent of swapchain image_count. Capping at 2 is required so
+  // available/finished semaphores are not reused while the presentation
+  // engine may still be waiting on them (a common TDR / driver-crash cause
+  // when CPU is faster than vsync and FIF == image_count).
+  uint32_t frames_in_flight = 2;
+  // Invoked after this frame's submission has completed on the GPU, before
+  // presentKHR. Setting a hook forces a fence wait for that frame even when
+  // synchronous_frames is false — leave it unset on hot paths.
   std::function<void(uint32_t renderedImageIndex)> after_render_before_present;
 
   vk::CommandBuffer& getCurrentCommandBuffer() {
@@ -2481,6 +2496,8 @@ struct Present {
 
   void acquireForFrame() {
     if (has_acquired_image) return;
+    if (frames_in_flight > 0 && swapchain->current_frame >= frames_in_flight)
+      swapchain->current_frame = 0;
     auto dev = *device;
     (void)dev->waitForFences(1, &getInFlightFence(), VK_TRUE, UINT64_MAX);
 
@@ -2552,6 +2569,52 @@ struct Present {
     return finished_semaphore[swapchain->current_frame];
   }
 
+  /// Block until the given frame slot's last submission has completed.
+  /// Use for reclaiming per-frame resources when synchronous_frames == false.
+  void waitForFrameSlot(size_t slot) {
+    if (!device || slot >= in_flight_fences.size()) return;
+    (void)(*device)->waitForFences(1, &in_flight_fences[slot], VK_TRUE, UINT64_MAX);
+  }
+
+  /// Block until every in-flight frame has completed. Scoped alternative to a
+  /// device-wide waitIdle before destroying swapchain-dependent resources.
+  void waitForAllFrames() {
+    if (!device || in_flight_fences.empty()) return;
+    (void)(*device)->waitForFences(uint32_t(in_flight_fences.size()),
+                                   in_flight_fences.data(), VK_TRUE, UINT64_MAX);
+  }
+
+  /// Destroy all owned Vulkan objects. Present has no destructor (it is
+  /// copied by value from PresentBuilder::build), so owners must call this
+  /// before overwriting or dropping an initialized instance.
+  void destroy() {
+    if (!device || !device->instance) return;
+    // Full idle: semaphores below may still be referenced by an outstanding
+    // presentKHR, which no fence covers. destroy() is a teardown-only path.
+    (void)(*device)->waitIdle();
+    auto& dev = *device;
+    for (auto f : in_flight_fences)
+      if (f) dev->destroyFence(f);
+    in_flight_fences.clear();
+    // image_in_flight holds non-owning aliases of in_flight_fences.
+    image_in_flight.clear();
+    for (auto s : available_semaphores)
+      if (s) dev->destroySemaphore(s);
+    available_semaphores.clear();
+    for (auto s : finished_semaphore)
+      if (s) dev->destroySemaphore(s);
+    finished_semaphore.clear();
+    for (auto fb : framebuffers)
+      if (fb) dev->destroyFramebuffer(fb, device->allocation_callbacks);
+    framebuffers.clear();
+    command_buffers.clear();
+    if (command_pool) {
+      dev->destroyCommandPool(command_pool, device->allocation_callbacks);
+      command_pool = vk::CommandPool{};
+    }
+    has_acquired_image = false;
+  }
+
   void create_swapchain() {
     vkb::SwapchainBuilder swapchain_builder{*device};
     auto swap_ret = swapchain_builder.set_old_swapchain(*swapchain).build();
@@ -2560,7 +2623,9 @@ struct Present {
   }
 
   void recreate_swapchain() {
-    (*device)->waitIdle();
+    // Rare event; full idle is fine here and also covers outstanding
+    // presentKHR waits on the semaphores destroyed below.
+    (void)(*device)->waitIdle();
     (*device)->destroyCommandPool(command_pool, device->allocation_callbacks);
     for (auto framebuffer : framebuffers) {
       (*device)->destroyFramebuffer(framebuffer, device->allocation_callbacks);
@@ -2570,8 +2635,25 @@ struct Present {
     create_swapchain();
     framebuffers = swapchain->createFramebuffers(this->render_pass, depth_attachment);
     command_pool = device->createCommandPool();
+    frames_in_flight = std::min(2u, std::max(1u, swapchain->image_count));
+    if (swapchain->current_frame >= frames_in_flight)
+      swapchain->current_frame = 0;
     command_buffers = device->createCommandBuffers(
-                         command_pool, swapchain->image_count);
+                         command_pool, frames_in_flight);
+    // Sync objects follow frames_in_flight, not swapchain image_count.
+    if (in_flight_fences.size() != frames_in_flight) {
+      for (auto f : in_flight_fences)
+        if (f) (*device)->destroyFence(f);
+      for (auto s : available_semaphores)
+        if (s) (*device)->destroySemaphore(s);
+      for (auto s : finished_semaphore)
+        if (s) (*device)->destroySemaphore(s);
+      in_flight_fences = device->createFences(frames_in_flight);
+      available_semaphores = device->createSemaphores(frames_in_flight);
+      finished_semaphore = device->createSemaphores(frames_in_flight);
+    }
+    // Old aliases point at fences of retired swapchain images.
+    image_in_flight.assign(swapchain->image_count, vk::Fence{});
     has_acquired_image = false;
   }
 
@@ -2587,7 +2669,13 @@ struct Present {
     if (getImageInFlight(acquired_image_index)) {
       (void)dev->waitForFences(1, &getImageInFlight(acquired_image_index), VK_TRUE, UINT64_MAX);
     }
-    getImageInFlight(acquired_image_index) = getInFlightFence();
+    // This slot's fence may still be aliased on a previous image index from
+    // an earlier use of the slot. Clear stale aliases before rebinding so a
+    // later acquire of that old image does not wait on the wrong submission.
+    const vk::Fence slotFence = getInFlightFence();
+    for (auto &f : image_in_flight)
+      if (f == slotFence) f = vk::Fence{};
+    getImageInFlight(acquired_image_index) = slotFence;
 
     vk::Semaphore          wait_semaphores[] = { getAvailableSemaphore() };
     vk::PipelineStageFlags wait_stages[]     = {vk::PipelineStageFlagBits::eColorAttachmentOutput};
@@ -2604,11 +2692,15 @@ struct Present {
     submitInfo.pSignalSemaphores      = signal_semaphores;
 
     (void)dev->resetFences(1, &getInFlightFence());
-    graphics_queue.submit(1, &submitInfo, getInFlightFence());
-
-    (void)dev->waitIdle();
+    (void)graphics_queue.submit(1, &submitInfo, getInFlightFence());
 
     last_presented_image_index = acquired_image_index;
+    // Wait only on this frame's fence — never a device-wide waitIdle, which
+    // would also drain unrelated queues/frames and serialize CPU and GPU.
+    // Needed in synchronous mode (legacy resource-lifetime contract) and
+    // whenever a capture hook must observe the completed frame.
+    if (synchronous_frames || after_render_before_present)
+      (void)dev->waitForFences(1, &getInFlightFence(), VK_TRUE, UINT64_MAX);
     if (after_render_before_present)
       after_render_before_present(last_presented_image_index);
 
@@ -2630,8 +2722,8 @@ struct Present {
     } else if (result != vk::Result::eSuccess) {
       throw std::runtime_error("failed to present swapchain image");
     }
-    if (swapchain->image_count > 0)
-      swapchain->current_frame = (swapchain->current_frame + 1) % swapchain->image_count;
+    if (frames_in_flight > 0)
+      swapchain->current_frame = (swapchain->current_frame + 1) % frames_in_flight;
   }
 };
 
@@ -2644,16 +2736,24 @@ public:
 
   Present build(vk::RenderPass render_pass, vk::ImageView depth_view = {}) {
     Present cb{device, swapchain};
+    // Never match FIF to image_count: reusing a present-wait semaphore while
+    // the WSI engine still holds it is a well-known driver TDR.
+    cb.frames_in_flight = std::min(2u, std::max(1u, swapchain.image_count));
+    if (swapchain.current_frame >= cb.frames_in_flight)
+      swapchain.current_frame = 0;
     cb.command_pool = device.createCommandPool();
     cb.command_buffers = device.createCommandBuffers(
-                         cb.command_pool, swapchain.image_count);
+                         cb.command_pool, cb.frames_in_flight);
     cb.depth_attachment = depth_view;
     cb.framebuffers = swapchain.createFramebuffers(render_pass, depth_view);
 
-    cb.in_flight_fences = device.createFences(swapchain.image_count);
-    cb.image_in_flight = device.createFences(swapchain.image_count);
-    cb.available_semaphores = device.createSemaphores(swapchain.image_count);
-    cb.finished_semaphore = device.createSemaphores(swapchain.image_count);
+    cb.in_flight_fences = device.createFences(cb.frames_in_flight);
+    // Non-owning aliases of in_flight_fences, keyed by swapchain image index;
+    // null until an image is first used (creating real fences here would leak
+    // them on first overwrite and adds pointless first-frame waits).
+    cb.image_in_flight.assign(swapchain.image_count, vk::Fence{});
+    cb.available_semaphores = device.createSemaphores(cb.frames_in_flight);
+    cb.finished_semaphore = device.createSemaphores(cb.frames_in_flight);
 
     cb.graphics_queue = device.getQueue(QueueType::graphics);
     cb.present_queue = device.getQueue(QueueType::present);
@@ -2672,7 +2772,7 @@ protected:
 #pragma region Buffer
 
 
-inline static /// Execute commands immediately and wait for the device to finish.
+inline static /// Execute commands immediately and wait for this submission to finish.
 void executeImmediately(vk::Device device, vk::CommandPool commandPool, vk::Queue queue, const std::function<void (vk::CommandBuffer cb)> &func) {
   vk::CommandBufferAllocateInfo cbai{ commandPool, vk::CommandBufferLevel::ePrimary, 1 };
 
@@ -2684,8 +2784,13 @@ void executeImmediately(vk::Device device, vk::CommandPool commandPool, vk::Queu
   vk::SubmitInfo submit;
   submit.commandBufferCount = (uint32_t)cbs.size();
   submit.pCommandBuffers = cbs.data();
-  queue.submit(submit, vk::Fence{});
-  device.waitIdle();
+  // Wait on a fence scoped to this submission only. A device-wide waitIdle
+  // here would also drain in-flight frames, serializing every caller (texture
+  // uploads, shadow/G-buffer/offscreen passes) against the whole GPU.
+  vk::Fence fence = device.createFence(vk::FenceCreateInfo{});
+  queue.submit(submit, fence);
+  (void)device.waitForFences(1, &fence, VK_TRUE, UINT64_MAX);
+  device.destroyFence(fence);
 
   device.freeCommandBuffers(commandPool, cbs);
 }
@@ -2907,8 +3012,13 @@ inline BlockParams getBlockParams(vk::Format format) {
 struct GenericBuffer {
   vk::Buffer buffer;
   vk::DeviceMemory memory;
-  vk::DeviceSize size;
-  vkb::Device* device;
+  vk::DeviceSize size = 0;
+  vkb::Device* device = nullptr;
+  // Size the buffer was created with; allocate() reuses the allocation for
+  // any request that fits and matches usage/memflags.
+  vk::DeviceSize capacity = 0;
+  vk::BufferUsageFlags usage_flags{};
+  vk::MemoryPropertyFlags memory_flags{};
 
   GenericBuffer() {}
 
@@ -2919,14 +3029,27 @@ struct GenericBuffer {
 
   void allocate(vkb::Device& device, vk::BufferUsageFlags usage, vk::DeviceSize size, vk::MemoryPropertyFlags memflags = vk::MemoryPropertyFlagBits::eDeviceLocal)
   {
+    // Reuse the current allocation when it is compatible and large enough.
+    // Keeps the vk::Buffer handle stable (descriptor sets stay valid) and
+    // avoids vkCreateBuffer/vkAllocateMemory on repeated per-frame calls.
+    if (buffer && this->device == &device && usage_flags == usage &&
+        memory_flags == memflags && size <= capacity) {
+      this->size = size;
+      return;
+    }
+    if (buffer) release();
+
     this->size = size;
     this->device = &device;
+    usage_flags = usage;
+    memory_flags = memflags;
     // Create the buffer object without memory.
     vk::BufferCreateInfo ci{};
     ci.size = size;
     ci.usage = usage;
     ci.sharingMode = vk::SharingMode::eExclusive;
     buffer = device->createBuffer(ci, device.allocation_callbacks);
+    capacity = size;
 
     // Find out how much memory and which heap to allocate from.
     auto memreq = device->getBufferMemoryRequirements(buffer);
@@ -2941,7 +3064,13 @@ struct GenericBuffer {
   }
 
   void release() {
-    (*device)->destroyBuffer(buffer, (*device).allocation_callbacks);
+    if (!device) return;
+    if (buffer) (*device)->destroyBuffer(buffer, (*device).allocation_callbacks);
+    if (memory) (*device)->freeMemory(memory, (*device).allocation_callbacks);
+    buffer = vk::Buffer{};
+    memory = vk::DeviceMemory{};
+    size = 0;
+    capacity = 0;
   }
 
   inline static /// Utility function for finding memory types for uniforms and images.
@@ -2959,13 +3088,15 @@ struct GenericBuffer {
     if (size == 0) return;
     using buf = vk::BufferUsageFlagBits;
     using pfb = vk::MemoryPropertyFlagBits;
-    auto tmp = GenericBuffer(*device, buf::eTransferSrc, size, pfb::eHostVisible);
+    auto tmp = GenericBuffer(*device, buf::eTransferSrc, size, pfb::eHostVisible | pfb::eHostCoherent);
     tmp.updateLocal(value, size);
 
     executeImmediately(device->instance, commandPool, queue, [&](vk::CommandBuffer cb) {
       vk::BufferCopy bc{0, 0, size};
       cb.copyBuffer(tmp.buffer, buffer, bc);
     });
+    // executeImmediately is fence-synchronous, so the staging copy is done.
+    tmp.release();
   }
 
   template<typename T>
@@ -3041,13 +3172,16 @@ struct HostVertexBuffer : public GenericBuffer {
   HostVertexBuffer() {}
   template<class Type, class Allocator = std::allocator<Type> >
   HostVertexBuffer(vkb::Device& device, const std::vector<Type, Allocator> &value) 
-    : GenericBuffer(device, vk::BufferUsageFlagBits::eVertexBuffer, value.size() * sizeof(Type), vk::MemoryPropertyFlagBits::eHostVisible) {
+    : GenericBuffer(device, vk::BufferUsageFlagBits::eVertexBuffer, value.size() * sizeof(Type),
+                    vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent) {
     updateLocal(value);
   }
 
   template<class Type, class Allocator = std::allocator<Type> >
   void allocate(vkb::Device& device, const std::vector<Type, Allocator> &value) {
-    GenericBuffer::allocate(device, vk::BufferUsageFlagBits::eVertexBuffer, value.size() * sizeof(Type), vk::MemoryPropertyFlagBits::eHostVisible);
+    GenericBuffer::allocate(device, vk::BufferUsageFlagBits::eVertexBuffer, value.size() * sizeof(Type),
+                            vk::MemoryPropertyFlagBits::eHostVisible |
+                                vk::MemoryPropertyFlagBits::eHostCoherent);
     updateLocal(value);
   }
 };
@@ -3071,13 +3205,16 @@ struct HostIndexBuffer : public GenericBuffer {
   HostIndexBuffer() {}
   template<class Type, class Allocator = std::allocator<Type> >
   HostIndexBuffer(vkb::Device& device, const std::vector<Type, Allocator> &value) 
-    : GenericBuffer(device, vk::BufferUsageFlagBits::eIndexBuffer, value.size() * sizeof(Type), vk::MemoryPropertyFlagBits::eHostVisible) {
+    : GenericBuffer(device, vk::BufferUsageFlagBits::eIndexBuffer, value.size() * sizeof(Type),
+                    vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent) {
     updateLocal(device, value);
   }
 
   template<class Type, class Allocator = std::allocator<Type> >
   void allocate(vkb::Device& device, const std::vector<Type, Allocator> &value) {
-    GenericBuffer::allocate(device, vk::BufferUsageFlagBits::eIndexBuffer, value.size() * sizeof(Type), vk::MemoryPropertyFlagBits::eHostVisible);
+    GenericBuffer::allocate(device, vk::BufferUsageFlagBits::eIndexBuffer, value.size() * sizeof(Type),
+                            vk::MemoryPropertyFlagBits::eHostVisible |
+                                vk::MemoryPropertyFlagBits::eHostCoherent);
     updateLocal(device, value);
   }
 };
@@ -3176,7 +3313,8 @@ public:
   }
 
   void upload(vk::CommandPool commandPool, vk::Queue queue, const void *data, vk::DeviceSize sizeInBytes) {
-    GenericBuffer stagingBuffer(*device, (vk::BufferUsageFlags)vk::BufferUsageFlagBits::eTransferSrc, sizeInBytes, vk::MemoryPropertyFlagBits::eHostVisible);
+    GenericBuffer stagingBuffer(*device, (vk::BufferUsageFlags)vk::BufferUsageFlagBits::eTransferSrc, sizeInBytes,
+                                vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
     stagingBuffer.updateLocal(data, sizeInBytes);
 
     // Copy the staging buffer to the GPU texture and set the layout.
