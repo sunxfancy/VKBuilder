@@ -9,6 +9,7 @@
 #include <deque>
 #include <functional>
 #include <stdexcept>
+#include <utility>
 
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
@@ -36,6 +37,8 @@ struct Agent {
 
 
 #pragma region Instance
+class PhysicalDeviceSelector;
+
 struct Instance : Agent<vk::Instance> {
   vk::DebugUtilsMessengerEXT debug_messenger;
 
@@ -43,6 +46,9 @@ struct Instance : Agent<vk::Instance> {
   uint32_t instance_version = VK_MAKE_VERSION(1, 2, 0);
 
   void destroy() { instance.destroy(debug_messenger, allocation_callbacks); }
+
+  /// Physical device selection requires a live Instance.
+  PhysicalDeviceSelector selectPhysicalDevice() const;
 };
 
 // Gathers useful information about the available vulkan capabilities, like
@@ -762,6 +768,9 @@ struct PhysicalDevice : Agent<vk::PhysicalDevice>{
     return 0;
   }
 
+  /// Logical device creation requires a selected PhysicalDevice.
+  DeviceBuilder createDevice() const;
+
 private:
   std::vector<std::string> extensions_to_enable;
   QueueFamilies queue_families;
@@ -1222,10 +1231,30 @@ private:
 
 enum class QueueType { present, graphics, compute, transfer };
 
+class SwapchainBuilder;
+class PresentBuilder;
+class PipelineBuilder;
+class PipelineLayoutBuilder;
+class RenderPassBuilder;
+class ColorAttachmentImage;
+class DepthTarget;
+class DepthArrayImage;
+
+/// Features actually enabled on this logical device (selector-stage tags).
+struct DeviceCaps {
+  bool samplerAnisotropy = false;
+  bool swapchain = false;
+  float maxSamplerAnisotropy = 1.f;
+};
+
 struct Device : Agent<vk::Device> {
   PhysicalDevice physical_device;
   vk::SurfaceKHR surface;
   QueueFamilies queue_families;
+  DeviceCaps caps;
+
+  bool hasAnisotropy() const { return caps.samplerAnisotropy; }
+  bool hasSwapchain() const { return caps.swapchain; }
 
   uint32_t get_queue_index(QueueType type) const {
     uint32_t index = QUEUE_INDEX_MAX_VALUE;
@@ -1290,6 +1319,20 @@ struct Device : Agent<vk::Device> {
     pool_info.flags = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
     return instance.createCommandPool(pool_info, allocation_callbacks);
   }
+
+  SwapchainBuilder createSwapchain();
+  PresentBuilder createPresent(struct Swapchain &swapchain);
+  RenderPassBuilder createRenderPass() const;
+  PipelineBuilder createPipeline() const;
+  PipelineBuilder createPipeline(const struct Swapchain &swapchain) const;
+  PipelineLayoutBuilder createPipelineLayout() const;
+  ColorAttachmentImage createColorTarget(uint32_t width, uint32_t height,
+                                         vk::Format format = vk::Format::eR8G8B8A8Unorm);
+  DepthTarget createDepthTarget(uint32_t width, uint32_t height,
+                                vk::Format format = vk::Format::eD32Sfloat,
+                                bool sampled = false);
+  DepthArrayImage createDepthArray(uint32_t width, uint32_t height, uint32_t layers,
+                                   vk::Format format = vk::Format::eD32Sfloat);
 
   std::vector<vk::CommandBuffer> createCommandBuffers(vk::CommandPool pool, uint32_t count = 1) {
     vk::CommandBufferAllocateInfo allocInfo = {};
@@ -1440,6 +1483,12 @@ public:
     device.surface = info.surface;
     device.queue_families = info.queue_families;
     device.allocation_callbacks = info.allocation_callbacks;
+    device.caps.samplerAnisotropy = info.features.samplerAnisotropy == VK_TRUE;
+    device.caps.swapchain = bool(info.surface) || info.defer_surface_initialization;
+    device.caps.maxSamplerAnisotropy =
+        info.physical_device.properties.limits.maxSamplerAnisotropy;
+    if (device.caps.maxSamplerAnisotropy < 1.f)
+      device.caps.maxSamplerAnisotropy = 1.f;
     return device;
   }
 
@@ -1565,9 +1614,8 @@ public:
     info.surface = device.surface;
     auto present = device.get_queue_index(QueueType::present);
     auto graphics = device.get_queue_index(QueueType::graphics);
-    // TODO: handle error of queue's not available
-    info.graphics_queue_index = present;
-    info.present_queue_index = graphics;
+    info.graphics_queue_index = graphics;
+    info.present_queue_index = present;
     info.allocation_callbacks = device.allocation_callbacks;
   }
   explicit SwapchainBuilder(Device &device,
@@ -1579,9 +1627,8 @@ public:
     temp_device.surface = surface;
     auto present = temp_device.get_queue_index(QueueType::present);
     auto graphics = temp_device.get_queue_index(QueueType::graphics);
-    // TODO: handle error of queue's not available
-    info.graphics_queue_index = present;
-    info.present_queue_index = graphics;
+    info.graphics_queue_index = graphics;
+    info.present_queue_index = present;
     info.allocation_callbacks = device.allocation_callbacks;
   }
   explicit SwapchainBuilder(
@@ -1936,6 +1983,62 @@ private:
 
 #pragma region RenderPass
 
+/// Attachment view handed to a framebuffer / render pass. Distinct from SampledImage.
+struct AttachmentView {
+  vk::ImageView view{};
+  vk::ImageAspectFlags aspect = vk::ImageAspectFlagBits::eColor;
+  vk::ImageLayout layout = vk::ImageLayout::eColorAttachmentOptimal;
+};
+
+/// Render pass plus the attachment signature pipelines and framebuffers must match.
+struct BuiltRenderPass {
+  vk::RenderPass handle{};
+  uint32_t colorAttachmentCount = 0;
+  bool hasDepth = false;
+  bool colorsSampledAfter = false;
+  bool depthSampledAfter = false;
+  vk::ImageLayout colorFinalLayout = vk::ImageLayout::eColorAttachmentOptimal;
+  vk::ImageLayout depthFinalLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal;
+
+  operator vk::RenderPass() const { return handle; }
+  explicit operator bool() const { return static_cast<bool>(handle); }
+
+  uint32_t attachmentCount() const { return colorAttachmentCount + (hasDepth ? 1u : 0u); }
+
+  vk::Framebuffer createFramebuffer(const Device &device, uint32_t width, uint32_t height,
+                                    const std::vector<vk::ImageView> &views) const {
+    if (uint32_t(views.size()) != attachmentCount())
+      throw std::runtime_error("framebuffer attachment count does not match render pass");
+    vk::FramebufferCreateInfo framebuffer_info{};
+    framebuffer_info.renderPass = handle;
+    framebuffer_info.attachmentCount = uint32_t(views.size());
+    framebuffer_info.pAttachments = views.data();
+    framebuffer_info.width = width;
+    framebuffer_info.height = height;
+    framebuffer_info.layers = 1;
+    return device->createFramebuffer(framebuffer_info, device.allocation_callbacks);
+  }
+
+  vk::Framebuffer createFramebuffer(const Device &device, uint32_t width, uint32_t height,
+                                    const std::vector<AttachmentView> &atts) const {
+    if (uint32_t(atts.size()) != attachmentCount())
+      throw std::runtime_error("framebuffer attachment count does not match render pass");
+    for (uint32_t i = 0; i < colorAttachmentCount; ++i) {
+      if (atts[i].aspect & vk::ImageAspectFlagBits::eDepth)
+        throw std::runtime_error("color attachment slot received a depth view");
+    }
+    if (hasDepth) {
+      const AttachmentView &depth = atts.back();
+      if (!(depth.aspect & vk::ImageAspectFlagBits::eDepth))
+        throw std::runtime_error("depth attachment slot missing depth aspect");
+    }
+    std::vector<vk::ImageView> views;
+    views.reserve(atts.size());
+    for (const auto &a : atts) views.push_back(a.view);
+    return createFramebuffer(device, width, height, views);
+  }
+};
+
 class RenderPassBuilder;
 class SubpassBuilder {
 public:
@@ -1960,15 +2063,23 @@ public:
   RenderPassBuilder(Device const &device) 
     : device(device) {
   }
-  vk::RenderPass build() {
+  BuiltRenderPass build() {
     vk::RenderPassCreateInfo info;
-    info.attachmentCount = attachments.size();
+    info.attachmentCount = uint32_t(attachments.size());
     info.pAttachments = attachments.data();
-    info.subpassCount = subpass.size();
+    info.subpassCount = uint32_t(subpass.size());
     info.pSubpasses = subpass.data();
-    info.dependencyCount = dependencies.size();
+    info.dependencyCount = uint32_t(dependencies.size());
     info.pDependencies = dependencies.data();
-    return device->createRenderPass(info, device.allocation_callbacks);
+    BuiltRenderPass out;
+    out.handle = device->createRenderPass(info, device.allocation_callbacks);
+    out.colorAttachmentCount = colorCount;
+    out.hasDepth = hasDepthAtt;
+    out.colorsSampledAfter = colorsSampledAfter;
+    out.depthSampledAfter = depthSampledAfter;
+    out.colorFinalLayout = colorFinalLayout;
+    out.depthFinalLayout = depthFinalLayout;
+    return out;
   }
    
   RenderPassBuilder& addAttachment(const vk::AttachmentDescription& ad) {
@@ -1991,6 +2102,19 @@ public:
         .setInitialLayout(vk::ImageLayout::eUndefined)
         .setFinalLayout(vk::ImageLayout::eColorAttachmentOptimal)
     );
+    ++colorCount;
+    colorFinalLayout = vk::ImageLayout::eColorAttachmentOptimal;
+    return *this;
+  }
+
+  /// Color attachment stored and left in SHADER_READ_ONLY so it can become a SampledImage.
+  RenderPassBuilder& addSampledColorAttachment(
+      vk::Format image_format,
+      vk::AttachmentLoadOp loadOp = vk::AttachmentLoadOp::eClear) {
+    addColorAttachment(image_format, loadOp, vk::AttachmentStoreOp::eStore);
+    attachments.back().setFinalLayout(vk::ImageLayout::eShaderReadOnlyOptimal);
+    colorsSampledAfter = true;
+    colorFinalLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
     return *this;
   }
 
@@ -2009,6 +2133,8 @@ public:
         .setInitialLayout(vk::ImageLayout::eUndefined)
         .setFinalLayout(vk::ImageLayout::ePresentSrcKHR)
     );
+    ++colorCount;
+    colorFinalLayout = vk::ImageLayout::ePresentSrcKHR;
     return *this;
   }
 
@@ -2027,6 +2153,38 @@ public:
         .setInitialLayout(vk::ImageLayout::eUndefined)
         .setFinalLayout(vk::ImageLayout::eDepthStencilAttachmentOptimal)
     );
+    hasDepthAtt = true;
+    depthFinalLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal;
+    return *this;
+  }
+
+  /// Depth attachment stored and left in SHADER_READ_ONLY (e.g. GBuffer hwDepth, CSM).
+  RenderPassBuilder& addSampledDepthAttachment(
+      vk::Format image_format,
+      vk::AttachmentLoadOp loadOp = vk::AttachmentLoadOp::eClear) {
+    addDepthAttachment(image_format, loadOp, vk::AttachmentStoreOp::eStore);
+    attachments.back().setFinalLayout(vk::ImageLayout::eShaderReadOnlyOptimal);
+    depthSampledAfter = true;
+    depthFinalLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
+    return *this;
+  }
+
+  /// EXTERNAL→subpass 0 and 0→EXTERNAL barriers for write-then-sample in the same CB.
+  RenderPassBuilder& addExternalShaderReadDependencies() {
+    vk::PipelineStageFlags dstWrite = vk::PipelineStageFlagBits::eColorAttachmentOutput;
+    vk::AccessFlags dstAccess = vk::AccessFlagBits::eColorAttachmentWrite;
+    vk::PipelineStageFlags srcWrite = vk::PipelineStageFlagBits::eColorAttachmentOutput;
+    vk::AccessFlags srcAccess = vk::AccessFlagBits::eColorAttachmentWrite;
+    if (hasDepthAtt) {
+      dstWrite |= vk::PipelineStageFlagBits::eEarlyFragmentTests;
+      dstAccess |= vk::AccessFlagBits::eDepthStencilAttachmentWrite;
+      srcWrite |= vk::PipelineStageFlagBits::eLateFragmentTests;
+      srcAccess |= vk::AccessFlagBits::eDepthStencilAttachmentWrite;
+    }
+    addDependency(VK_SUBPASS_EXTERNAL, 0, vk::PipelineStageFlagBits::eFragmentShader, dstWrite,
+                  vk::AccessFlagBits::eShaderRead, dstAccess);
+    addDependency(0, VK_SUBPASS_EXTERNAL, srcWrite, vk::PipelineStageFlagBits::eFragmentShader,
+                  srcAccess, vk::AccessFlagBits::eShaderRead);
     return *this;
   }
 
@@ -2061,6 +2219,12 @@ private:
   std::vector<std::vector<vk::AttachmentReference> > refs;
   std::vector<vk::AttachmentReference> depthRefs;
   std::vector<vk::SubpassDependency> dependencies;
+  uint32_t colorCount = 0;
+  bool hasDepthAtt = false;
+  bool colorsSampledAfter = false;
+  bool depthSampledAfter = false;
+  vk::ImageLayout colorFinalLayout = vk::ImageLayout::eColorAttachmentOptimal;
+  vk::ImageLayout depthFinalLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal;
 };
 
 
@@ -2127,13 +2291,108 @@ public:
   std::vector< vk::VertexInputAttributeDescription > input_attributes;
 };
 
-class PipelineBuilder {
+class PipelineLayoutBuilder {
 public:
-  PipelineBuilder(const Device &device, const Swapchain & swapchain)
-    : device(device), swapchain(swapchain) {
+  explicit PipelineLayoutBuilder(const Device &device) : device(device) {}
+
+  PipelineLayoutBuilder &set(vk::DescriptorSetLayout layout) {
+    layouts.push_back(layout);
+    return *this;
+  }
+  PipelineLayoutBuilder &push(vk::ShaderStageFlags stages, uint32_t size, uint32_t offset = 0) {
+    ranges.push_back(vk::PushConstantRange{stages, offset, size});
+    return *this;
+  }
+  template <class T>
+  PipelineLayoutBuilder &push(vk::ShaderStageFlags stages, uint32_t offset = 0) {
+    return push(stages, uint32_t(sizeof(T)), offset);
+  }
+  vk::PipelineLayout build() const {
+    vk::PipelineLayoutCreateInfo info{};
+    info.setLayoutCount = uint32_t(layouts.size());
+    info.pSetLayouts = layouts.data();
+    info.pushConstantRangeCount = uint32_t(ranges.size());
+    info.pPushConstantRanges = ranges.data();
+    return device->createPipelineLayout(info, device.allocation_callbacks);
   }
 
-  vk::Pipeline build(vk::RenderPass render_pass, uint32_t subpass = 0) {
+private:
+  const Device &device;
+  std::vector<vk::DescriptorSetLayout> layouts;
+  std::vector<vk::PushConstantRange> ranges;
+};
+
+class PipelineBuilder {
+public:
+  explicit PipelineBuilder(const Device &device) : device(device) {}
+  PipelineBuilder(const Device &device, const Swapchain &swapchain)
+    : device(device), swapchain(&swapchain), default_extent(swapchain.extent) {
+  }
+
+  PipelineBuilder &setPipelineLayout(vk::PipelineLayout layout) {
+    pipeline_layout = layout;
+    return *this;
+  }
+  PipelineBuilder &setExtent(vk::Extent2D extent) {
+    default_extent = extent;
+    return *this;
+  }
+  PipelineBuilder &setDepthStencil(bool testEnable, bool writeEnable,
+                                   vk::CompareOp compareOp = vk::CompareOp::eLess) {
+    depth_stencil_set = true;
+    depth_stencil.depthTestEnable = testEnable;
+    depth_stencil.depthWriteEnable = writeEnable;
+    depth_stencil.depthCompareOp = compareOp;
+    depth_stencil.depthBoundsTestEnable = false;
+    depth_stencil.stencilTestEnable = false;
+    return *this;
+  }
+  PipelineBuilder &setDepthStencil(vk::PipelineDepthStencilStateCreateInfo ds) {
+    depth_stencil_set = true;
+    depth_stencil = ds;
+    return *this;
+  }
+  PipelineBuilder &setColorAttachmentCount(uint32_t count) {
+    use_default_color_blending = false;
+    fillOpaqueBlend(count);
+    return *this;
+  }
+  PipelineBuilder &setDepthBias(float constantFactor, float slopeFactor, float clamp = 0.f) {
+    rasterizer.depthBiasEnable = VK_TRUE;
+    rasterizer.depthBiasConstantFactor = constantFactor;
+    rasterizer.depthBiasSlopeFactor = slopeFactor;
+    rasterizer.depthBiasClamp = clamp;
+    use_default_rasterizer = false;
+    return *this;
+  }
+
+  vk::Pipeline build(const BuiltRenderPass &rp, uint32_t subpass = 0) {
+    if (use_default_color_blending)
+      fillOpaqueBlend(rp.colorAttachmentCount);
+    if (rp.hasDepth && !depth_stencil_set)
+      setDepthStencil(true, true, vk::CompareOp::eLess);
+    return buildHandle(rp.handle, subpass);
+  }
+
+  PipelineBuilder& setAlphaBlending(uint32_t count = 1) {
+    use_default_color_blending = false;
+    vk::PipelineColorBlendAttachmentState att{};
+    att.colorWriteMask =
+        vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+        vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
+    att.blendEnable = true;
+    att.srcColorBlendFactor = vk::BlendFactor::eSrcAlpha;
+    att.dstColorBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha;
+    att.colorBlendOp = vk::BlendOp::eAdd;
+    att.srcAlphaBlendFactor = vk::BlendFactor::eOne;
+    att.dstAlphaBlendFactor = vk::BlendFactor::eOneMinusSrcAlpha;
+    att.alphaBlendOp = vk::BlendOp::eAdd;
+    colorBlendAttachments.assign(count, att);
+    return *this;
+  }
+
+private:
+  vk::Pipeline buildHandle(vk::RenderPass render_pass, uint32_t subpass = 0) {
     if (use_default_input_state) setVertexInputState(VertexInputStateBuilder().build());
     else if (use_input_state_builder) setVertexInputState(input_state_builder.build());
     
@@ -2142,25 +2401,36 @@ public:
     if (use_default_scissor) addScissor();
     if (use_default_rasterizer) setRasterizer();
     if (use_default_multisampling) setMultisampler();
-    if (use_default_color_blending) setColorBlending();
+    if (use_default_color_blending) fillOpaqueBlend(1);
 
     vk::PipelineDynamicStateCreateInfo dynamic_info;
     dynamic_info.dynamicStateCount = static_cast<uint32_t>(dynamic_states.size());
     dynamic_info.pDynamicStates    = dynamic_states.data();
 
-    vk::PipelineLayoutCreateInfo pipeline_layout_info;
-    pipeline_layout_info.setLayoutCount         = 0;
-    pipeline_layout_info.pushConstantRangeCount = 0;
-    vk::PipelineLayout layout = device->createPipelineLayout(pipeline_layout_info);
+    if (!pipeline_layout)
+      throw std::runtime_error("PipelineBuilder: setPipelineLayout is required");
+    vk::PipelineLayout layout = pipeline_layout;
+
+    if (dynamic_states.size() && viewports.empty()) {
+      viewports.push_back(vk::Viewport{0.f, 0.f, 1.f, 1.f, 0.f, 1.f});
+    }
+    if (dynamic_states.size() && scissors.empty()) {
+      scissors.push_back(vk::Rect2D{{0, 0}, {1, 1}});
+    }
 
     vk::PipelineViewportStateCreateInfo viewport_state;
-    viewport_state.viewportCount = viewports.size();
+    viewport_state.viewportCount = uint32_t(viewports.size());
     viewport_state.pViewports    = viewports.data();
-    viewport_state.scissorCount  = scissors.size();
+    viewport_state.scissorCount  = uint32_t(scissors.size());
     viewport_state.pScissors     = scissors.data();
 
+    color_blending.logicOpEnable     = false;
+    color_blending.logicOp           = vk::LogicOp::eCopy;
+    color_blending.attachmentCount   = uint32_t(colorBlendAttachments.size());
+    color_blending.pAttachments      = colorBlendAttachments.data();
+
     vk::GraphicsPipelineCreateInfo pipeline_info;
-    pipeline_info.stageCount          = shader_stages.size();
+    pipeline_info.stageCount          = uint32_t(shader_stages.size());
     pipeline_info.pStages             = shader_stages.data();
     pipeline_info.pVertexInputState   = &input_state;
     pipeline_info.pInputAssemblyState = &input_assembly;
@@ -2180,6 +2450,7 @@ public:
     return result.value;
   }
 
+public:
   PipelineBuilder& useClassicPipeline(const std::vector<uint32_t>& vert, const std::vector<uint32_t>& frag) {
     vk::ShaderModule vert_module = createShaderModule(device, vert);
     vk::ShaderModule frag_module = createShaderModule(device, frag);
@@ -2281,7 +2552,7 @@ public:
   PipelineBuilder& addScissor(vk::Rect2D scissor = {}) {
     use_default_scissor = false;
     if (scissor.extent == vk::Extent2D())
-      scissor.extent   = swapchain.extent;
+      scissor.extent = default_extent.width ? default_extent : vk::Extent2D{1, 1};
     scissors.push_back(scissor);
     return *this;
   }
@@ -2290,8 +2561,10 @@ public:
     vk::Viewport viewport = {};
     viewport.x          = x;
     viewport.y          = y;
-    viewport.width      = width == -1.0f ? swapchain.extent.width : width;
-    viewport.height     = height == -1.0f ? swapchain.extent.height : height;
+    const float dw = default_extent.width ? float(default_extent.width) : 1.f;
+    const float dh = default_extent.height ? float(default_extent.height) : 1.f;
+    viewport.width      = width == -1.0f ? dw : width;
+    viewport.height     = height == -1.0f ? dh : height;
     viewport.minDepth   = minDepth;
     viewport.maxDepth   = maxDepth;
 
@@ -2345,19 +2618,7 @@ public:
   }
 
   PipelineBuilder& setColorBlending() {
-    use_default_color_blending = false;
-    colorBlendAttachment.colorWriteMask =
-        vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG | vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
-    colorBlendAttachment.blendEnable = false;
-
-    color_blending.logicOpEnable     = false;
-    color_blending.logicOp           = vk::LogicOp::eCopy;
-    color_blending.attachmentCount   = 1;
-    color_blending.pAttachments      = &colorBlendAttachment;
-    color_blending.blendConstants[0] = 0.0f;
-    color_blending.blendConstants[1] = 0.0f;
-    color_blending.blendConstants[2] = 0.0f;
-    color_blending.blendConstants[3] = 0.0f;
+    fillOpaqueBlend(1);
     return *this;
   }
 
@@ -2394,8 +2655,20 @@ public:
   }
 
 private:
+  void fillOpaqueBlend(uint32_t count) {
+    use_default_color_blending = false;
+    vk::PipelineColorBlendAttachmentState att{};
+    att.colorWriteMask =
+        vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
+        vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
+    att.blendEnable = false;
+    colorBlendAttachments.assign(count, att);
+  }
+
   Device const& device;
-  Swapchain const& swapchain;
+  const Swapchain* swapchain = nullptr;
+  vk::Extent2D default_extent{};
+  vk::PipelineLayout pipeline_layout{};
 
   std::vector<vk::PipelineShaderStageCreateInfo> shader_stages;
   // Cannot use vector, since the string object will deconstruct during pushing back.
@@ -2424,10 +2697,11 @@ private:
   bool use_default_multisampling = true;
   vk::PipelineMultisampleStateCreateInfo multisampling;
 
+  bool depth_stencil_set = false;
   vk::PipelineDepthStencilStateCreateInfo depth_stencil{};
 
   bool use_default_color_blending = true;
-  vk::PipelineColorBlendAttachmentState colorBlendAttachment;
+  std::vector<vk::PipelineColorBlendAttachmentState> colorBlendAttachments;
   vk::PipelineColorBlendStateCreateInfo color_blending;
 };
 
@@ -2436,14 +2710,44 @@ private:
 
 #pragma region Present
 
+/// In-flight slot after a successful acquire. Index host-visible resources with
+/// this (UBO/VBO ping-pong) so CPU never overwrites a buffer GPU still reads.
+struct FrameSlot {
+  uint32_t index = 0;
+  /// CPU-sync path: executeImmediately / waitIdle / one-shot mesh upload.
+  static FrameSlot gpuIdle() { return FrameSlot{~0u}; }
+  bool isGpuIdle() const { return index == ~0u; }
+};
+
+struct Present;
+struct RecordingCmd;
+struct InRenderPass;
+struct RecordedCmd;
+struct AcquiredFrame;
+struct BoundSet;
+
 // Each thread should have a single struct for commands recording
 struct Present {
   Swapchain* swapchain = nullptr;
   Device* device = nullptr;
 
-  Present() {}
+  Present() = default;
   Present(Device& device, Swapchain& swapchain)
     : device(&device), swapchain(&swapchain) {}
+  Present(const Present &) = delete;
+  Present &operator=(const Present &) = delete;
+  Present(Present &&o) noexcept { moveFrom(o); }
+  Present &operator=(Present &&o) noexcept {
+    if (this != &o) {
+      destroy();
+      moveFrom(o);
+    }
+    return *this;
+  }
+  ~Present() {
+    if (command_pool || !in_flight_fences.empty() || !framebuffers.empty())
+      destroy();
+  }
 
   vk::Queue graphics_queue;
   vk::Queue present_queue;
@@ -2484,6 +2788,16 @@ struct Present {
   // synchronous_frames is false — leave it unset on hot paths.
   std::function<void(uint32_t renderedImageIndex)> after_render_before_present;
 
+  FrameSlot currentSlot() const {
+    return FrameSlot{swapchain ? uint32_t(swapchain->current_frame) : 0u};
+  }
+
+  friend struct RecordingCmd;
+  friend struct InRenderPass;
+  friend struct RecordedCmd;
+  friend struct AcquiredFrame;
+
+private:
   vk::CommandBuffer& getCurrentCommandBuffer() {
     return command_buffers[swapchain->current_frame];
   }
@@ -2493,6 +2807,8 @@ struct Present {
                                       : static_cast<uint32_t>(swapchain->current_frame);
     return framebuffers[idx];
   }
+
+public:
 
   void acquireForFrame() {
     if (has_acquired_image) return;
@@ -2515,45 +2831,15 @@ struct Present {
     has_acquired_image = true;
   }
 
-  void begin() {
-    acquireForFrame();
-    // If acquire failed (out-of-date surface), do not begin recording — the
-    // owner recreates the swapchain and retries. Beginning here would leave a
-    // CB in recording state with no valid framebuffer target.
-    if (!has_acquired_image) return;
-    vk::CommandBufferBeginInfo begin_info;
-    auto buffer = getCurrentCommandBuffer();
-    buffer.reset();
-    buffer.begin(begin_info);
-  }
-
-  void end() {
-    auto buffer = getCurrentCommandBuffer();
-    buffer.end();
-  }
-
-  void beginRenderPass(vk::RenderPass render_pass,
-                       const vk::ClearValue *clearValues,
-                       uint32_t clearCount) {
-    this->render_pass = render_pass;
-    vk::RenderPassBeginInfo render_pass_info = {};
-    render_pass_info.renderPass            = render_pass;
-    render_pass_info.framebuffer           = getCurrentFrameBuffer();
-    render_pass_info.renderArea.offset     = vk::Offset2D{0, 0};
-    render_pass_info.renderArea.extent     = swapchain->extent;
-    render_pass_info.clearValueCount       = clearCount;
-    render_pass_info.pClearValues          = clearValues;
-    getCurrentCommandBuffer().beginRenderPass(render_pass_info, vk::SubpassContents::eInline);
-  }
-
-  void beginRenderPass(vk::RenderPass render_pass, 
-    vk::ClearValue clearColor = vk::ClearColorValue(std::array<float, 4>{0.0f, 0.0f, 0.0f, 1.0f})) {    
-    beginRenderPass(render_pass, &clearColor, 1);
-  }
-
-  void endRenderPass() {
-    getCurrentCommandBuffer().endRenderPass();
-  }
+  AcquiredFrame acquire();
+  RecordingCmd begin();
+  RecordedCmd end();
+  InRenderPass beginRenderPass(vk::RenderPass render_pass,
+                               const vk::ClearValue *clearValues,
+                               uint32_t clearCount);
+  InRenderPass beginRenderPass(vk::RenderPass render_pass,
+    vk::ClearValue clearColor = vk::ClearColorValue(std::array<float, 4>{0.0f, 0.0f, 0.0f, 1.0f}));
+  RecordingCmd endRenderPass();
 
   vk::Fence& getInFlightFence() {
     return in_flight_fences[swapchain->current_frame];
@@ -2584,9 +2870,31 @@ struct Present {
                                    in_flight_fences.data(), VK_TRUE, UINT64_MAX);
   }
 
-  /// Destroy all owned Vulkan objects. Present has no destructor (it is
-  /// copied by value from PresentBuilder::build), so owners must call this
-  /// before overwriting or dropping an initialized instance.
+  void moveFrom(Present &o) noexcept {
+    swapchain = o.swapchain; o.swapchain = nullptr;
+    device = o.device; o.device = nullptr;
+    graphics_queue = o.graphics_queue;
+    present_queue = o.present_queue;
+    command_pool = o.command_pool; o.command_pool = vk::CommandPool{};
+    command_buffers = std::move(o.command_buffers);
+    framebuffers = std::move(o.framebuffers);
+    in_flight_fences = std::move(o.in_flight_fences);
+    image_in_flight = std::move(o.image_in_flight);
+    available_semaphores = std::move(o.available_semaphores);
+    finished_semaphore = std::move(o.finished_semaphore);
+    render_pass = o.render_pass;
+    depth_attachment = o.depth_attachment;
+    last_presented_image_index = o.last_presented_image_index;
+    acquired_image_index = o.acquired_image_index;
+    has_acquired_image = o.has_acquired_image; o.has_acquired_image = false;
+    needs_recreate = o.needs_recreate;
+    synchronous_frames = o.synchronous_frames;
+    frames_in_flight = o.frames_in_flight;
+    after_render_before_present = std::move(o.after_render_before_present);
+  }
+
+  /// Destroy all owned Vulkan objects. Safe to call more than once; the
+  /// destructor invokes this if fences / command pool are still live.
   void destroy() {
     if (!device || !device->instance) return;
     // Full idle: semaphores below may still be referenced by an outstanding
@@ -2734,7 +3042,20 @@ public:
     : device(device), swapchain(swapchain) {}
   virtual ~PresentBuilder() {}
 
-  Present build(vk::RenderPass render_pass, vk::ImageView depth_view = {}) {
+  Present build(const BuiltRenderPass &render_pass, vk::ImageView depth_view = {}) {
+    if (render_pass.colorAttachmentCount != 1)
+      throw std::runtime_error("Present render pass must have exactly 1 color attachment");
+    if (render_pass.colorFinalLayout != vk::ImageLayout::ePresentSrcKHR)
+      throw std::runtime_error("Present render pass finalLayout must be PresentSrcKHR");
+    if (render_pass.hasDepth && !depth_view)
+      throw std::runtime_error("Present render pass has depth but no depth view was provided");
+    if (!render_pass.hasDepth && depth_view)
+      throw std::runtime_error("Present depth view provided but render pass has no depth attachment");
+    return buildHandle(render_pass.handle, depth_view);
+  }
+
+private:
+  Present buildHandle(vk::RenderPass render_pass, vk::ImageView depth_view) {
     Present cb{device, swapchain};
     // Never match FIF to image_count: reusing a present-wait semaphore while
     // the WSI engine still holds it is a well-known driver TDR.
@@ -2764,6 +3085,107 @@ protected:
   Device& device;
   Swapchain& swapchain;
 };
+
+struct RecordingCmd {
+  Present *present = nullptr;
+  FrameSlot slot_{};
+
+  explicit operator bool() const { return present && present->has_acquired_image; }
+  FrameSlot slot() const { return slot_; }
+  vk::CommandBuffer &commandBuffer() { return present->getCurrentCommandBuffer(); }
+
+  InRenderPass beginRenderPass(const BuiltRenderPass &rp, const vk::ClearValue *clears, uint32_t count);
+  InRenderPass beginRenderPass(
+      const BuiltRenderPass &rp,
+      vk::ClearValue clearColor = vk::ClearColorValue(std::array<float, 4>{0.f, 0.f, 0.f, 1.f}));
+  RecordedCmd end();
+  void bindGraphics(vk::PipelineLayout layout, const BoundSet &set, uint32_t firstSet = 0);
+};
+
+struct InRenderPass {
+  Present *present = nullptr;
+  FrameSlot slot_{};
+
+  explicit operator bool() const { return present != nullptr; }
+  FrameSlot slot() const { return slot_; }
+  vk::CommandBuffer &commandBuffer() { return present->getCurrentCommandBuffer(); }
+  RecordingCmd endRenderPass();
+  void bindGraphics(vk::PipelineLayout layout, const BoundSet &set, uint32_t firstSet = 0);
+};
+
+struct RecordedCmd {
+  Present *present = nullptr;
+  FrameSlot slot_{};
+  void submitAndPresent() {
+    if (present) present->drawFrame();
+  }
+};
+
+struct AcquiredFrame {
+  Present *present = nullptr;
+  FrameSlot slot_{};
+  uint32_t imageIndex = 0;
+  explicit operator bool() const { return present && present->has_acquired_image; }
+  FrameSlot slot() const { return slot_; }
+  RecordingCmd begin();
+};
+
+inline AcquiredFrame Present::acquire() {
+  acquireForFrame();
+  if (!has_acquired_image) return {};
+  return AcquiredFrame{this, currentSlot(), acquired_image_index};
+}
+
+inline RecordingCmd Present::begin() {
+  acquireForFrame();
+  if (!has_acquired_image) return {};
+  vk::CommandBufferBeginInfo begin_info;
+  auto buffer = getCurrentCommandBuffer();
+  buffer.reset();
+  buffer.begin(begin_info);
+  return RecordingCmd{this, currentSlot()};
+}
+
+inline RecordedCmd Present::end() {
+  getCurrentCommandBuffer().end();
+  return RecordedCmd{this, currentSlot()};
+}
+
+inline InRenderPass Present::beginRenderPass(vk::RenderPass rp, const vk::ClearValue *clearValues,
+                                             uint32_t clearCount) {
+  this->render_pass = rp;
+  vk::RenderPassBeginInfo render_pass_info{};
+  render_pass_info.renderPass = rp;
+  render_pass_info.framebuffer = getCurrentFrameBuffer();
+  render_pass_info.renderArea.offset = vk::Offset2D{0, 0};
+  render_pass_info.renderArea.extent = swapchain->extent;
+  render_pass_info.clearValueCount = clearCount;
+  render_pass_info.pClearValues = clearValues;
+  getCurrentCommandBuffer().beginRenderPass(render_pass_info, vk::SubpassContents::eInline);
+  return InRenderPass{this, currentSlot()};
+}
+
+inline InRenderPass Present::beginRenderPass(vk::RenderPass rp, vk::ClearValue clearColor) {
+  return beginRenderPass(rp, &clearColor, 1);
+}
+
+inline RecordingCmd Present::endRenderPass() {
+  getCurrentCommandBuffer().endRenderPass();
+  return RecordingCmd{this, currentSlot()};
+}
+
+inline InRenderPass RecordingCmd::beginRenderPass(const BuiltRenderPass &rp, const vk::ClearValue *clears,
+                                                  uint32_t count) {
+  return present->beginRenderPass(rp.handle, clears, count);
+}
+inline InRenderPass RecordingCmd::beginRenderPass(const BuiltRenderPass &rp, vk::ClearValue clearColor) {
+  return present->beginRenderPass(rp.handle, clearColor);
+}
+inline RecordedCmd RecordingCmd::end() { return present->end(); }
+
+inline RecordingCmd InRenderPass::endRenderPass() { return present->endRenderPass(); }
+
+inline RecordingCmd AcquiredFrame::begin() { return present->begin(); }
 
 
 #pragma endregion 
@@ -3024,11 +3446,33 @@ struct GenericBuffer {
 
   GenericBuffer(vkb::Device& device, vk::BufferUsageFlags usage, vk::DeviceSize size, vk::MemoryPropertyFlags memflags = vk::MemoryPropertyFlagBits::eDeviceLocal) 
   {
-    allocate(device, usage, size, memflags);
+    allocate(FrameSlot::gpuIdle(), device, usage, size, memflags);
   }
 
-  void allocate(vkb::Device& device, vk::BufferUsageFlags usage, vk::DeviceSize size, vk::MemoryPropertyFlags memflags = vk::MemoryPropertyFlagBits::eDeviceLocal)
+  ~GenericBuffer() { release(); }
+  GenericBuffer(const GenericBuffer &) = delete;
+  GenericBuffer &operator=(const GenericBuffer &) = delete;
+  GenericBuffer(GenericBuffer &&o) noexcept { steal(o); }
+  GenericBuffer &operator=(GenericBuffer &&o) noexcept {
+    if (this != &o) {
+      release();
+      steal(o);
+    }
+    return *this;
+  }
+
+  /// Relinquish handles without destroying them (caller takes ownership).
+  void detach() {
+    buffer = vk::Buffer{};
+    memory = vk::DeviceMemory{};
+    size = 0;
+    capacity = 0;
+    device = nullptr;
+  }
+
+  void allocate(FrameSlot slot, vkb::Device& device, vk::BufferUsageFlags usage, vk::DeviceSize size, vk::MemoryPropertyFlags memflags = vk::MemoryPropertyFlagBits::eDeviceLocal)
   {
+    (void)slot;
     // Reuse the current allocation when it is compatible and large enough.
     // Keeps the vk::Buffer handle stable (descriptor sets stay valid) and
     // avoids vkCreateBuffer/vkAllocateMemory on repeated per-frame calls.
@@ -3063,14 +3507,22 @@ struct GenericBuffer {
     device->bindBufferMemory(buffer, memory, 0);
   }
 
+  void steal(GenericBuffer &o) noexcept {
+    buffer = o.buffer;
+    memory = o.memory;
+    size = o.size;
+    device = o.device;
+    capacity = o.capacity;
+    usage_flags = o.usage_flags;
+    memory_flags = o.memory_flags;
+    o.detach();
+  }
+
   void release() {
     if (!device) return;
     if (buffer) (*device)->destroyBuffer(buffer, (*device).allocation_callbacks);
     if (memory) (*device)->freeMemory(memory, (*device).allocation_callbacks);
-    buffer = vk::Buffer{};
-    memory = vk::DeviceMemory{};
-    size = 0;
-    capacity = 0;
+    detach();
   }
 
   inline static /// Utility function for finding memory types for uniforms and images.
@@ -3089,7 +3541,7 @@ struct GenericBuffer {
     using buf = vk::BufferUsageFlagBits;
     using pfb = vk::MemoryPropertyFlagBits;
     auto tmp = GenericBuffer(*device, buf::eTransferSrc, size, pfb::eHostVisible | pfb::eHostCoherent);
-    tmp.updateLocal(value, size);
+    tmp.updateLocal(FrameSlot::gpuIdle(), value, size);
 
     executeImmediately(device->instance, commandPool, queue, [&](vk::CommandBuffer cb) {
       vk::BufferCopy bc{0, 0, size};
@@ -3114,22 +3566,22 @@ struct GenericBuffer {
     cb.pipelineBarrier(srcStageMask, dstStageMask, dependencyFlags, nullptr, bmb, nullptr);
   }
 
-  /// For a host visible buffer, copy memory to the buffer object.
-  void updateLocal(const void *value, vk::DeviceSize size) const {
+  /// Host-visible write. `slot` must be this frame's FrameSlot (or gpuIdle after waitIdle).
+  void updateLocal(FrameSlot slot, const void *value, vk::DeviceSize size) const {
+    (void)slot;
     void *ptr = (*device)->mapMemory(memory, 0, size, vk::MemoryMapFlags{});
     memcpy(ptr, value, (size_t)size);
-    // flush();
     (*device)->unmapMemory(memory);
   }
 
   template<class Type, class Allocator>
-  void updateLocal(const std::vector<Type, Allocator> &value) const {
-    updateLocal( (void*)value.data(), vk::DeviceSize(value.size() * sizeof(Type)));
+  void updateLocal(FrameSlot slot, const std::vector<Type, Allocator> &value) const {
+    updateLocal(slot, (void*)value.data(), vk::DeviceSize(value.size() * sizeof(Type)));
   }
 
   template<class Type>
-  void updateLocal(const Type &value) const {
-    updateLocal( (void*)&value, vk::DeviceSize(sizeof(Type)));
+  void updateLocal(FrameSlot slot, const Type &value) const {
+    updateLocal(slot, (void*)&value, vk::DeviceSize(sizeof(Type)));
   }
 
   void *map() const { return (*device)->mapMemory(memory, 0, size, vk::MemoryMapFlags{}); };
@@ -3163,7 +3615,7 @@ struct VertexBuffer : public GenericBuffer {
       size, vk::MemoryPropertyFlagBits::eDeviceLocal) {}
 
   void allocate(vkb::Device& device, size_t size) {
-    GenericBuffer::allocate(device, vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eTransferDst, size, vk::MemoryPropertyFlagBits::eDeviceLocal);
+    GenericBuffer::allocate(FrameSlot::gpuIdle(), device, vk::BufferUsageFlagBits::eVertexBuffer | vk::BufferUsageFlagBits::eTransferDst, size, vk::MemoryPropertyFlagBits::eDeviceLocal);
   }
 };
 
@@ -3174,15 +3626,15 @@ struct HostVertexBuffer : public GenericBuffer {
   HostVertexBuffer(vkb::Device& device, const std::vector<Type, Allocator> &value) 
     : GenericBuffer(device, vk::BufferUsageFlagBits::eVertexBuffer, value.size() * sizeof(Type),
                     vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent) {
-    updateLocal(value);
+    updateLocal(FrameSlot::gpuIdle(), value);
   }
 
   template<class Type, class Allocator = std::allocator<Type> >
-  void allocate(vkb::Device& device, const std::vector<Type, Allocator> &value) {
-    GenericBuffer::allocate(device, vk::BufferUsageFlagBits::eVertexBuffer, value.size() * sizeof(Type),
+  void allocate(FrameSlot slot, vkb::Device& device, const std::vector<Type, Allocator> &value) {
+    GenericBuffer::allocate(slot, device, vk::BufferUsageFlagBits::eVertexBuffer, value.size() * sizeof(Type),
                             vk::MemoryPropertyFlagBits::eHostVisible |
                                 vk::MemoryPropertyFlagBits::eHostCoherent);
-    updateLocal(value);
+    updateLocal(slot, value);
   }
 };
 
@@ -3195,7 +3647,7 @@ struct IndexBuffer : public GenericBuffer {
                     size, vk::MemoryPropertyFlagBits::eDeviceLocal) {}
 
   void allocate(vkb::Device& device, vk::DeviceSize size) {
-    GenericBuffer::allocate(device, vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eTransferDst, 
+    GenericBuffer::allocate(FrameSlot::gpuIdle(), device, vk::BufferUsageFlagBits::eIndexBuffer | vk::BufferUsageFlagBits::eTransferDst, 
                     size, vk::MemoryPropertyFlagBits::eDeviceLocal);
   }
 };
@@ -3207,15 +3659,15 @@ struct HostIndexBuffer : public GenericBuffer {
   HostIndexBuffer(vkb::Device& device, const std::vector<Type, Allocator> &value) 
     : GenericBuffer(device, vk::BufferUsageFlagBits::eIndexBuffer, value.size() * sizeof(Type),
                     vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent) {
-    updateLocal(device, value);
+    updateLocal(FrameSlot::gpuIdle(), value);
   }
 
   template<class Type, class Allocator = std::allocator<Type> >
   void allocate(vkb::Device& device, const std::vector<Type, Allocator> &value) {
-    GenericBuffer::allocate(device, vk::BufferUsageFlagBits::eIndexBuffer, value.size() * sizeof(Type),
+    GenericBuffer::allocate(FrameSlot::gpuIdle(), device, vk::BufferUsageFlagBits::eIndexBuffer, value.size() * sizeof(Type),
                             vk::MemoryPropertyFlagBits::eHostVisible |
                                 vk::MemoryPropertyFlagBits::eHostCoherent);
-    updateLocal(device, value);
+    updateLocal(FrameSlot::gpuIdle(), value);
   }
 };
 
@@ -3228,7 +3680,7 @@ struct UniformBuffer : public GenericBuffer {
                     (vk::DeviceSize)size, vk::MemoryPropertyFlagBits::eDeviceLocal) {}
 
   void allocate(vkb::Device& device, size_t size) {
-    GenericBuffer::allocate(device, vk::BufferUsageFlagBits::eUniformBuffer | vk::BufferUsageFlagBits::eTransferDst, 
+    GenericBuffer::allocate(FrameSlot::gpuIdle(), device, vk::BufferUsageFlagBits::eUniformBuffer | vk::BufferUsageFlagBits::eTransferDst, 
                     (vk::DeviceSize)size, vk::MemoryPropertyFlagBits::eDeviceLocal);
   }
 };
@@ -3237,6 +3689,29 @@ struct UniformBuffer : public GenericBuffer {
 
 
 #pragma region Image
+
+struct SampledImage {
+  vk::Sampler sampler{};
+  vk::ImageView view{};
+  vk::ImageLayout layout = vk::ImageLayout::eShaderReadOnlyOptimal;
+
+  SampledImage() = default;
+  SampledImage(vk::Sampler s, vk::ImageView v,
+               vk::ImageLayout l = vk::ImageLayout::eShaderReadOnlyOptimal)
+      : sampler(s), view(v), layout(l) {}
+
+  /// Descriptor write before the first pass (layout will be shader-read when sampled).
+  static SampledImage forLaterSample(vk::Sampler s, vk::ImageView v) {
+    return SampledImage(s, v, vk::ImageLayout::eShaderReadOnlyOptimal);
+  }
+};
+
+/// Nearest-only sampler for depth images. Linear filtering of raw D32 is not valid PCF.
+struct DepthSampler {
+  vk::Sampler handle{};
+  operator vk::Sampler() const { return handle; }
+  explicit operator bool() const { return static_cast<bool>(handle); }
+};
 
 /// Generic image with a view and memory object.
 /// Vulkan images need a memory object to hold the data and a view object for the GPU to access the data.
@@ -3315,7 +3790,7 @@ public:
   void upload(vk::CommandPool commandPool, vk::Queue queue, const void *data, vk::DeviceSize sizeInBytes) {
     GenericBuffer stagingBuffer(*device, (vk::BufferUsageFlags)vk::BufferUsageFlagBits::eTransferSrc, sizeInBytes,
                                 vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent);
-    stagingBuffer.updateLocal(data, sizeInBytes);
+    stagingBuffer.updateLocal(FrameSlot::gpuIdle(), data, sizeInBytes);
 
     // Copy the staging buffer to the GPU texture and set the layout.
     executeImmediately(device->instance, commandPool, queue, [&](vk::CommandBuffer cb) {
@@ -3400,14 +3875,41 @@ public:
     s.currentLayout = oldLayout;
   }
 
+  void beginColorAttachment() { s.currentLayout = vk::ImageLayout::eColorAttachmentOptimal; }
+  void beginDepthAttachment() { s.currentLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal; }
+  void endSampledLayout() { s.currentLayout = vk::ImageLayout::eShaderReadOnlyOptimal; }
+
   vk::Format format() const { return s.info.format; }
   vk::Extent3D extent() const { return s.info.extent; }
   const vk::ImageCreateInfo &info() const { return s.info; }
+  vk::ImageLayout currentLayout() const { return s.currentLayout; }
+
+  AttachmentView asAttachment() const {
+    const bool depth = bool(s.aspectMask & vk::ImageAspectFlagBits::eDepth);
+    return AttachmentView{
+        imageView(), s.aspectMask,
+        depth ? vk::ImageLayout::eDepthStencilAttachmentOptimal
+              : vk::ImageLayout::eColorAttachmentOptimal};
+  }
+
+  /// Only valid when the GPU layout is already shader-readable (not a current color/depth attachment).
+  SampledImage sampled(vk::Sampler sampler = {}) const {
+    const vk::ImageLayout layout = s.currentLayout;
+    if (layout == vk::ImageLayout::eColorAttachmentOptimal ||
+        layout == vk::ImageLayout::eDepthStencilAttachmentOptimal)
+      throw std::runtime_error("cannot sample an image that is a current render-pass attachment");
+    if (layout != vk::ImageLayout::eShaderReadOnlyOptimal &&
+        layout != vk::ImageLayout::eDepthStencilReadOnlyOptimal)
+      throw std::runtime_error("image is not in a sampled layout");
+    return SampledImage(sampler, imageView(), layout);
+  }
+
 protected:
   void create(vkb::Device& device, const vk::ImageCreateInfo &info, vk::ImageViewType viewType, vk::ImageAspectFlags aspectMask, bool hostImage) {
     this->device = &device;
     s.currentLayout = info.initialLayout;
     s.info = info;
+    s.aspectMask = aspectMask;
     s.image = device->createImageUnique(info);
 
     // Find out how much memory and which heap to allocate from.
@@ -3442,6 +3944,7 @@ protected:
     vk::DeviceSize size;
     vk::ImageLayout currentLayout;
     vk::ImageCreateInfo info;
+    vk::ImageAspectFlags aspectMask = vk::ImageAspectFlagBits::eColor;
   };
 
   State s;
@@ -3551,6 +4054,90 @@ public:
   }
 };
 
+using ColorTarget = ColorAttachmentImage;
+
+/// Depth (and optional sampled) attachment. `sampled=true` is required to produce a SampledImage.
+class DepthTarget : public GenericImage {
+public:
+  DepthTarget() {}
+
+  DepthTarget(Device& device, uint32_t width, uint32_t height,
+              vk::Format format = vk::Format::eD32Sfloat, bool sampled = false) {
+    vk::ImageCreateInfo info;
+    info.flags = {};
+    info.imageType = vk::ImageType::e2D;
+    info.format = format;
+    info.extent = vk::Extent3D{ width, height, 1U };
+    info.mipLevels = 1;
+    info.arrayLayers = 1;
+    info.samples = vk::SampleCountFlagBits::e1;
+    info.tiling = vk::ImageTiling::eOptimal;
+    info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+    if (sampled)
+      info.usage |= vk::ImageUsageFlagBits::eSampled;
+    info.sharingMode = vk::SharingMode::eExclusive;
+    info.initialLayout = vk::ImageLayout::eUndefined;
+    create(device, info, vk::ImageViewType::e2D, vk::ImageAspectFlagBits::eDepth, false);
+  }
+
+  SampledImage sampled(const DepthSampler &sampler) const {
+    return GenericImage::sampled(sampler.handle);
+  }
+
+private:
+  using GenericImage::sampled;
+};
+
+/// Depth 2D array (CSM cascades). Array view is for sampling; layer views are attachments.
+class DepthArrayImage : public GenericImage {
+public:
+  DepthArrayImage() {}
+
+  DepthArrayImage(Device& device, uint32_t width, uint32_t height, uint32_t layers,
+                  vk::Format format = vk::Format::eD32Sfloat) {
+    vk::ImageCreateInfo info;
+    info.imageType = vk::ImageType::e2D;
+    info.format = format;
+    info.extent = vk::Extent3D{ width, height, 1U };
+    info.mipLevels = 1;
+    info.arrayLayers = layers;
+    info.samples = vk::SampleCountFlagBits::e1;
+    info.tiling = vk::ImageTiling::eOptimal;
+    info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment | vk::ImageUsageFlagBits::eSampled;
+    info.sharingMode = vk::SharingMode::eExclusive;
+    info.initialLayout = vk::ImageLayout::eUndefined;
+    create(device, info, vk::ImageViewType::e2DArray, vk::ImageAspectFlagBits::eDepth, false);
+
+    layerViews.resize(layers);
+    for (uint32_t i = 0; i < layers; ++i) {
+      vk::ImageViewCreateInfo layerInfo{};
+      layerInfo.image = image();
+      layerInfo.viewType = vk::ImageViewType::e2D;
+      layerInfo.format = format;
+      layerInfo.subresourceRange = {vk::ImageAspectFlagBits::eDepth, 0, 1, i, 1};
+      layerViews[i] = device->createImageViewUnique(layerInfo);
+    }
+  }
+
+  vk::ImageView arrayView() const { return imageView(); }
+  uint32_t layerCount() const { return uint32_t(layerViews.size()); }
+  vk::ImageView layerView(uint32_t i) const { return *layerViews[i]; }
+  AttachmentView layerAttachment(uint32_t i) const {
+    return AttachmentView{layerView(i), vk::ImageAspectFlagBits::eDepth,
+                          vk::ImageLayout::eDepthStencilAttachmentOptimal};
+  }
+
+  SampledImage sampled(const DepthSampler &sampler) const {
+    return GenericImage::sampled(sampler.handle);
+  }
+
+private:
+  using GenericImage::sampled;
+  std::vector<vk::UniqueImageView> layerViews;
+};
+
+using Image2DArray = DepthArrayImage;
+
 /// A class to help build samplers.
 /// Samplers tell the shader stages how to sample an image.
 /// They are used in combination with an image to make a combined image sampler
@@ -3607,14 +4194,39 @@ public:
   SamplerBuilder &borderColor(vk::BorderColor value) { s.info.borderColor = value; return *this; }
   SamplerBuilder &unnormalizedCoordinates(vk::Bool32 value) { s.info.unnormalizedCoordinates = value; return *this; }
 
+  /// Nearest + clamp. Required for raw D32 depth compares (linear is not valid PCF).
+  SamplerBuilder &nearestClamp() {
+    magFilter(vk::Filter::eNearest);
+    minFilter(vk::Filter::eNearest);
+    mipmapMode(vk::SamplerMipmapMode::eNearest);
+    addressModeU(vk::SamplerAddressMode::eClampToEdge);
+    addressModeV(vk::SamplerAddressMode::eClampToEdge);
+    addressModeW(vk::SamplerAddressMode::eClampToEdge);
+    return *this;
+  }
+
   /// Allocate a self-deleting image.
   vk::UniqueSampler buildUnique(vk::Device device) const {
     return device.createSamplerUnique(s.info);
   }
 
-  /// Allocate a non self-deleting Sampler.
+  /// Allocate a non self-deleting Sampler. Does not check device feature tags.
   vk::Sampler build(vk::Device device) const {
     return device.createSampler(s.info);
+  }
+
+  /// Checks DeviceCaps::samplerAnisotropy before enabling anisotropic filtering.
+  vk::Sampler build(const Device &device) const {
+    if (s.info.anisotropyEnable && !device.hasAnisotropy())
+      throw std::runtime_error("anisotropic filtering requires DeviceCaps::samplerAnisotropy");
+    return device->createSampler(s.info, device.allocation_callbacks);
+  }
+
+  /// Depth sampler: nearest filter is required (linear D32 is not valid PCF).
+  DepthSampler buildDepth(const Device &device) const {
+    if (s.info.magFilter != vk::Filter::eNearest || s.info.minFilter != vk::Filter::eNearest)
+      throw std::runtime_error("depth sampling requires nearest filter (linear D32 is not valid PCF)");
+    return DepthSampler{build(device)};
   }
 
 private:
@@ -3631,6 +4243,55 @@ private:
 
 #pragma region DesciptorSet
 
+struct BoundSet;
+
+/// Newly allocated (or reopened after GPU idle). May be written with DescriptorSetUpdater.
+struct UnboundSet {
+  vk::DescriptorSet handle{};
+  UnboundSet() = default;
+  explicit UnboundSet(vk::DescriptorSet s) : handle(s) {}
+  UnboundSet(const UnboundSet &) = delete;
+  UnboundSet &operator=(const UnboundSet &) = delete;
+  UnboundSet(UnboundSet &&o) noexcept : handle(o.handle) { o.handle = vk::DescriptorSet{}; }
+  UnboundSet &operator=(UnboundSet &&o) noexcept {
+    handle = o.handle;
+    o.handle = vk::DescriptorSet{};
+    return *this;
+  }
+  explicit operator bool() const { return static_cast<bool>(handle); }
+  BoundSet publish() &&;
+  /// After waitIdle / slot fence, a bound set may be updated again.
+  static UnboundSet reopenAfterIdle(const BoundSet &bound);
+};
+
+/// Published set. May be bound; must not be updated while in-flight.
+struct BoundSet {
+  vk::DescriptorSet handle{};
+  BoundSet() = default;
+  explicit BoundSet(vk::DescriptorSet s) : handle(s) {}
+  operator vk::DescriptorSet() const { return handle; }
+  explicit operator bool() const { return static_cast<bool>(handle); }
+  const vk::DescriptorSet *ptr() const { return &handle; }
+};
+
+inline BoundSet UnboundSet::publish() && { return BoundSet{handle}; }
+inline UnboundSet UnboundSet::reopenAfterIdle(const BoundSet &bound) {
+  return UnboundSet{bound.handle};
+}
+
+inline void RecordingCmd::bindGraphics(vk::PipelineLayout layout, const BoundSet &set,
+                                       uint32_t firstSet) {
+  vk::DescriptorSet h = set;
+  commandBuffer().bindDescriptorSets(vk::PipelineBindPoint::eGraphics, layout, firstSet, 1, &h, 0,
+                                     nullptr);
+}
+inline void InRenderPass::bindGraphics(vk::PipelineLayout layout, const BoundSet &set,
+                                       uint32_t firstSet) {
+  vk::DescriptorSet h = set;
+  commandBuffer().bindDescriptorSets(vk::PipelineBindPoint::eGraphics, layout, firstSet, 1, &h, 0,
+                                     nullptr);
+}
+
 /// Convenience class for updating descriptor sets (uniforms)
 class DescriptorSetUpdater {
 public:
@@ -3642,8 +4303,8 @@ public:
   }
 
   /// Call this to begin a new descriptor set.
-  DescriptorSetUpdater& beginDescriptorSet(vk::DescriptorSet dstSet) {
-    dstSet_ = dstSet;
+  DescriptorSetUpdater& beginDescriptorSet(UnboundSet &dstSet) {
+    dstSet_ = dstSet.handle;
     return *this;
   }
 
@@ -3660,6 +4321,12 @@ public:
     return *this;
   }
 
+  /// Call this to add a combined image sampler. Layout must come from SampledImage.
+  DescriptorSetUpdater& image(const SampledImage &sampled) {
+    return image(sampled.sampler, sampled.view, sampled.layout);
+  }
+
+private:
   /// Call this to add a combined image sampler.
   DescriptorSetUpdater& image(vk::Sampler sampler, vk::ImageView imageView, vk::ImageLayout imageLayout) {
     if (!descriptorWrites_.empty() && numImages_ != imageInfo_.size() && descriptorWrites_.back().pImageInfo) {
@@ -3671,6 +4338,7 @@ public:
     return *this;
   }
 
+public:
   /// Call this to start defining buffers.
   DescriptorSetUpdater& beginBuffers(uint32_t dstBinding, uint32_t dstArrayElement, vk::DescriptorType descriptorType) {
     vk::WriteDescriptorSet wdesc{};
@@ -3829,6 +4497,38 @@ private:
 
 #pragma endregion
 
+inline PhysicalDeviceSelector Instance::selectPhysicalDevice() const {
+  return PhysicalDeviceSelector(*this);
+}
+
+inline DeviceBuilder PhysicalDevice::createDevice() const {
+  return DeviceBuilder(*this);
+}
+
+inline SwapchainBuilder Device::createSwapchain() { return SwapchainBuilder(*this); }
+inline PresentBuilder Device::createPresent(Swapchain &swapchain) {
+  return PresentBuilder(*this, swapchain);
+}
+inline RenderPassBuilder Device::createRenderPass() const { return RenderPassBuilder(*this); }
+inline PipelineBuilder Device::createPipeline() const { return PipelineBuilder(*this); }
+inline PipelineBuilder Device::createPipeline(const Swapchain &swapchain) const {
+  return PipelineBuilder(*this, swapchain);
+}
+inline PipelineLayoutBuilder Device::createPipelineLayout() const {
+  return PipelineLayoutBuilder(*this);
+}
+inline ColorAttachmentImage Device::createColorTarget(uint32_t width, uint32_t height,
+                                                      vk::Format format) {
+  return ColorAttachmentImage(*this, width, height, format);
+}
+inline DepthTarget Device::createDepthTarget(uint32_t width, uint32_t height, vk::Format format,
+                                             bool sampled) {
+  return DepthTarget(*this, width, height, format, sampled);
+}
+inline DepthArrayImage Device::createDepthArray(uint32_t width, uint32_t height, uint32_t layers,
+                                                vk::Format format) {
+  return DepthArrayImage(*this, width, height, layers, format);
+}
 
 } // namespace vkb
 
