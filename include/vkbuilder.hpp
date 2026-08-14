@@ -1995,7 +1995,11 @@ struct AttachmentView {
 /// Render pass plus the attachment signature pipelines and framebuffers must match.
 struct BuiltRenderPass {
   vk::RenderPass handle{};
+  /// Subpass color attachments (not including resolve targets). Pipelines must
+  /// match this count, not the total VkAttachmentDescription count.
   uint32_t colorAttachmentCount = 0;
+  /// 1x resolve targets paired with multisampled color attachments.
+  uint32_t resolveAttachmentCount = 0;
   bool hasDepth = false;
   bool colorsSampledAfter = false;
   bool depthSampledAfter = false;
@@ -2005,7 +2009,9 @@ struct BuiltRenderPass {
   operator vk::RenderPass() const { return handle; }
   explicit operator bool() const { return static_cast<bool>(handle); }
 
-  uint32_t attachmentCount() const { return colorAttachmentCount + (hasDepth ? 1u : 0u); }
+  uint32_t attachmentCount() const {
+    return colorAttachmentCount + resolveAttachmentCount + (hasDepth ? 1u : 0u);
+  }
 
   vk::Framebuffer createFramebuffer(const Device &device, uint32_t width, uint32_t height,
                                     const std::vector<vk::ImageView> &views) const {
@@ -2085,6 +2091,7 @@ public:
     BuiltRenderPass out;
     out.handle = device->createRenderPass(info, device.allocation_callbacks);
     out.colorAttachmentCount = colorCount;
+    out.resolveAttachmentCount = resolveCount;
     out.hasDepth = hasDepthAtt;
     out.colorsSampledAfter = colorsSampledAfter;
     out.depthSampledAfter = depthSampledAfter;
@@ -2132,9 +2139,11 @@ public:
   }
 
   /// 1x resolved color attachment for a multisampled render pass. Becomes a SampledImage.
+  /// loadOp defaults to DONT_CARE: the resolve overwrites the image, and CLEAR
+  /// on the resolve target crashes MoltenVK/Metal.
   RenderPassBuilder& addResolveColorAttachment(
       vk::Format image_format,
-      vk::AttachmentLoadOp loadOp = vk::AttachmentLoadOp::eClear) {
+      vk::AttachmentLoadOp loadOp = vk::AttachmentLoadOp::eDontCare) {
     attachments.push_back(
       vk::AttachmentDescription()
         .setFormat(image_format)
@@ -2146,7 +2155,7 @@ public:
         .setInitialLayout(vk::ImageLayout::eUndefined)
         .setFinalLayout(vk::ImageLayout::eShaderReadOnlyOptimal)
     );
-    ++colorCount;
+    ++resolveCount;
     colorsSampledAfter = true;
     colorFinalLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
     return *this;
@@ -2257,6 +2266,7 @@ private:
   std::vector<vk::AttachmentReference> resolveRefs;
   std::vector<vk::SubpassDependency> dependencies;
   uint32_t colorCount = 0;
+  uint32_t resolveCount = 0;
   bool hasDepthAtt = false;
   bool colorsSampledAfter = false;
   bool depthSampledAfter = false;
@@ -4086,7 +4096,11 @@ public:
     info.arrayLayers = 1;
     info.samples = samples;
     info.tiling = vk::ImageTiling::eOptimal;
-    info.usage = vk::ImageUsageFlagBits::eColorAttachment|vk::ImageUsageFlagBits::eTransferSrc|vk::ImageUsageFlagBits::eSampled;
+    // MSAA targets are resolve sources only. SAMPLED/TRANSFER on a multisample
+    // image is rejected or crashes later on MoltenVK/Metal.
+    info.usage = vk::ImageUsageFlagBits::eColorAttachment;
+    if (samples == vk::SampleCountFlagBits::e1)
+      info.usage |= vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eSampled;
     info.sharingMode = vk::SharingMode::eExclusive;
     info.queueFamilyIndexCount = 0;
     info.pQueueFamilyIndices = nullptr;
