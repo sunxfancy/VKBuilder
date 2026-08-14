@@ -1327,10 +1327,12 @@ struct Device : Agent<vk::Device> {
   PipelineBuilder createPipeline(const struct Swapchain &swapchain) const;
   PipelineLayoutBuilder createPipelineLayout() const;
   ColorAttachmentImage createColorTarget(uint32_t width, uint32_t height,
-                                         vk::Format format = vk::Format::eR8G8B8A8Unorm);
+                                         vk::Format format = vk::Format::eR8G8B8A8Unorm,
+                                         vk::SampleCountFlagBits samples = vk::SampleCountFlagBits::e1);
   DepthTarget createDepthTarget(uint32_t width, uint32_t height,
                                 vk::Format format = vk::Format::eD32Sfloat,
-                                bool sampled = false);
+                                bool sampled = false,
+                                vk::SampleCountFlagBits samples = vk::SampleCountFlagBits::e1);
   DepthArrayImage createDepthArray(uint32_t width, uint32_t height, uint32_t layers,
                                    vk::Format format = vk::Format::eD32Sfloat);
 
@@ -2043,6 +2045,12 @@ class RenderPassBuilder;
 class SubpassBuilder {
 public:
   SubpassBuilder& addAttachmentRef(int index, vk::ImageLayout layout);
+  SubpassBuilder& addResolveAttachment(int index, vk::ImageLayout layout) {
+    hasResolve = true;
+    resolveIdx = index;
+    resolveLayout = layout;
+    return *this;
+  }
   SubpassBuilder& setDepthStencilAttachment(int index, vk::ImageLayout layout) {
     hasDepth = true;
     depthIdx = index;
@@ -2056,6 +2064,9 @@ protected:
   bool hasDepth = false;
   int depthIdx = -1;
   vk::ImageLayout depthLayout = vk::ImageLayout::eDepthStencilAttachmentOptimal;
+  bool hasResolve = false;
+  int resolveIdx = -1;
+  vk::ImageLayout resolveLayout = vk::ImageLayout::eColorAttachmentOptimal;
 };
 
 class RenderPassBuilder {
@@ -2089,12 +2100,13 @@ public:
 
   RenderPassBuilder& addColorAttachment(vk::Format image_format, 
     vk::AttachmentLoadOp loadOp = vk::AttachmentLoadOp::eDontCare,
-    vk::AttachmentStoreOp storeOp = vk::AttachmentStoreOp::eDontCare
+    vk::AttachmentStoreOp storeOp = vk::AttachmentStoreOp::eDontCare,
+    vk::SampleCountFlagBits samples = vk::SampleCountFlagBits::e1
   ) {
     attachments.push_back(
       vk::AttachmentDescription() 
         .setFormat(image_format) 
-        .setSamples(vk::SampleCountFlagBits::e1)
+        .setSamples(samples)
         .setLoadOp(loadOp)
         .setStoreOp(storeOp)
         .setStencilLoadOp(vk::AttachmentLoadOp::eDontCare)
@@ -2110,9 +2122,31 @@ public:
   /// Color attachment stored and left in SHADER_READ_ONLY so it can become a SampledImage.
   RenderPassBuilder& addSampledColorAttachment(
       vk::Format image_format,
-      vk::AttachmentLoadOp loadOp = vk::AttachmentLoadOp::eClear) {
-    addColorAttachment(image_format, loadOp, vk::AttachmentStoreOp::eStore);
+      vk::AttachmentLoadOp loadOp = vk::AttachmentLoadOp::eClear,
+      vk::SampleCountFlagBits samples = vk::SampleCountFlagBits::e1) {
+    addColorAttachment(image_format, loadOp, vk::AttachmentStoreOp::eStore, samples);
     attachments.back().setFinalLayout(vk::ImageLayout::eShaderReadOnlyOptimal);
+    colorsSampledAfter = true;
+    colorFinalLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
+    return *this;
+  }
+
+  /// 1x resolved color attachment for a multisampled render pass. Becomes a SampledImage.
+  RenderPassBuilder& addResolveColorAttachment(
+      vk::Format image_format,
+      vk::AttachmentLoadOp loadOp = vk::AttachmentLoadOp::eClear) {
+    attachments.push_back(
+      vk::AttachmentDescription()
+        .setFormat(image_format)
+        .setSamples(vk::SampleCountFlagBits::e1)
+        .setLoadOp(loadOp)
+        .setStoreOp(vk::AttachmentStoreOp::eStore)
+        .setStencilLoadOp(vk::AttachmentLoadOp::eDontCare)
+        .setStencilStoreOp(vk::AttachmentStoreOp::eDontCare)
+        .setInitialLayout(vk::ImageLayout::eUndefined)
+        .setFinalLayout(vk::ImageLayout::eShaderReadOnlyOptimal)
+    );
+    ++colorCount;
     colorsSampledAfter = true;
     colorFinalLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
     return *this;
@@ -2140,12 +2174,13 @@ public:
 
   RenderPassBuilder& addDepthAttachment(vk::Format image_format,
     vk::AttachmentLoadOp loadOp = vk::AttachmentLoadOp::eClear,
-    vk::AttachmentStoreOp storeOp = vk::AttachmentStoreOp::eDontCare
+    vk::AttachmentStoreOp storeOp = vk::AttachmentStoreOp::eDontCare,
+    vk::SampleCountFlagBits samples = vk::SampleCountFlagBits::e1
   ) {
     attachments.push_back(
       vk::AttachmentDescription()
         .setFormat(image_format)
-        .setSamples(vk::SampleCountFlagBits::e1)
+        .setSamples(samples)
         .setLoadOp(loadOp)
         .setStoreOp(storeOp)
         .setStencilLoadOp(vk::AttachmentLoadOp::eDontCare)
@@ -2161,8 +2196,9 @@ public:
   /// Depth attachment stored and left in SHADER_READ_ONLY (e.g. GBuffer hwDepth, CSM).
   RenderPassBuilder& addSampledDepthAttachment(
       vk::Format image_format,
-      vk::AttachmentLoadOp loadOp = vk::AttachmentLoadOp::eClear) {
-    addDepthAttachment(image_format, loadOp, vk::AttachmentStoreOp::eStore);
+      vk::AttachmentLoadOp loadOp = vk::AttachmentLoadOp::eClear,
+      vk::SampleCountFlagBits samples = vk::SampleCountFlagBits::e1) {
+    addDepthAttachment(image_format, loadOp, vk::AttachmentStoreOp::eStore, samples);
     attachments.back().setFinalLayout(vk::ImageLayout::eShaderReadOnlyOptimal);
     depthSampledAfter = true;
     depthFinalLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
@@ -2218,6 +2254,7 @@ private:
   std::vector<vk::SubpassDescription> subpass;
   std::vector<std::vector<vk::AttachmentReference> > refs;
   std::vector<vk::AttachmentReference> depthRefs;
+  std::vector<vk::AttachmentReference> resolveRefs;
   std::vector<vk::SubpassDependency> dependencies;
   uint32_t colorCount = 0;
   bool hasDepthAtt = false;
@@ -2245,6 +2282,10 @@ inline vk::SubpassDescription SubpassBuilder::build(RenderPassBuilder& rpb, std:
   sd.pipelineBindPoint = vk::PipelineBindPoint::eGraphics;
   sd.colorAttachmentCount = refs.size();
   sd.pColorAttachments = refs.data();
+  if (hasResolve) {
+    rpb.resolveRefs.push_back(vk::AttachmentReference{uint32_t(resolveIdx), resolveLayout});
+    sd.pResolveAttachments = &rpb.resolveRefs.back();
+  }
   if (hasDepth) {
     rpb.depthRefs.push_back(
         vk::AttachmentReference{uint32_t(depthIdx), depthLayout});
@@ -4033,7 +4074,8 @@ class ColorAttachmentImage : public GenericImage {
 public:
   ColorAttachmentImage() {}
 
-  ColorAttachmentImage(Device& device, uint32_t width, uint32_t height, vk::Format format = vk::Format::eR8G8B8A8Unorm) {
+  ColorAttachmentImage(Device& device, uint32_t width, uint32_t height, vk::Format format = vk::Format::eR8G8B8A8Unorm,
+                       vk::SampleCountFlagBits samples = vk::SampleCountFlagBits::e1) {
     vk::ImageCreateInfo info;
     info.flags = {};
 
@@ -4042,7 +4084,7 @@ public:
     info.extent = vk::Extent3D{ width, height, 1U };
     info.mipLevels = 1;
     info.arrayLayers = 1;
-    info.samples = vk::SampleCountFlagBits::e1;
+    info.samples = samples;
     info.tiling = vk::ImageTiling::eOptimal;
     info.usage = vk::ImageUsageFlagBits::eColorAttachment|vk::ImageUsageFlagBits::eTransferSrc|vk::ImageUsageFlagBits::eSampled;
     info.sharingMode = vk::SharingMode::eExclusive;
@@ -4062,7 +4104,8 @@ public:
   DepthTarget() {}
 
   DepthTarget(Device& device, uint32_t width, uint32_t height,
-              vk::Format format = vk::Format::eD32Sfloat, bool sampled = false) {
+              vk::Format format = vk::Format::eD32Sfloat, bool sampled = false,
+              vk::SampleCountFlagBits samples = vk::SampleCountFlagBits::e1) {
     vk::ImageCreateInfo info;
     info.flags = {};
     info.imageType = vk::ImageType::e2D;
@@ -4070,7 +4113,7 @@ public:
     info.extent = vk::Extent3D{ width, height, 1U };
     info.mipLevels = 1;
     info.arrayLayers = 1;
-    info.samples = vk::SampleCountFlagBits::e1;
+    info.samples = samples;
     info.tiling = vk::ImageTiling::eOptimal;
     info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
     if (sampled)
@@ -4205,6 +4248,17 @@ public:
     return *this;
   }
 
+  /// Linear + clamp. For shadow-map PCF sampling (see buildDepthPcf).
+  SamplerBuilder &linearClamp() {
+    magFilter(vk::Filter::eLinear);
+    minFilter(vk::Filter::eLinear);
+    mipmapMode(vk::SamplerMipmapMode::eNearest);
+    addressModeU(vk::SamplerAddressMode::eClampToEdge);
+    addressModeV(vk::SamplerAddressMode::eClampToEdge);
+    addressModeW(vk::SamplerAddressMode::eClampToEdge);
+    return *this;
+  }
+
   /// Allocate a self-deleting image.
   vk::UniqueSampler buildUnique(vk::Device device) const {
     return device.createSamplerUnique(s.info);
@@ -4226,6 +4280,17 @@ public:
   DepthSampler buildDepth(const Device &device) const {
     if (s.info.magFilter != vk::Filter::eNearest || s.info.minFilter != vk::Filter::eNearest)
       throw std::runtime_error("depth sampling requires nearest filter (linear D32 is not valid PCF)");
+    return DepthSampler{build(device)};
+  }
+
+  /// Hardware-PCF depth sampler: linear filtering + depth compare. The compare
+  /// result of each 2x2 filtered depth sample is blended, giving hardware PCF.
+  /// Requires linear mag/min filter and compareEnable/compareOp to be set.
+  DepthSampler buildDepthPcf(const Device &device) const {
+    if (s.info.magFilter != vk::Filter::eLinear || s.info.minFilter != vk::Filter::eLinear)
+      throw std::runtime_error("depth PCF requires linear filter (see linearClamp)");
+    if (!s.info.compareEnable)
+      throw std::runtime_error("depth PCF requires compareEnable (see compareEnable(true))");
     return DepthSampler{build(device)};
   }
 
@@ -4518,12 +4583,13 @@ inline PipelineLayoutBuilder Device::createPipelineLayout() const {
   return PipelineLayoutBuilder(*this);
 }
 inline ColorAttachmentImage Device::createColorTarget(uint32_t width, uint32_t height,
-                                                      vk::Format format) {
-  return ColorAttachmentImage(*this, width, height, format);
+                                                      vk::Format format,
+                                                      vk::SampleCountFlagBits samples) {
+  return ColorAttachmentImage(*this, width, height, format, samples);
 }
 inline DepthTarget Device::createDepthTarget(uint32_t width, uint32_t height, vk::Format format,
-                                             bool sampled) {
-  return DepthTarget(*this, width, height, format, sampled);
+                                             bool sampled, vk::SampleCountFlagBits samples) {
+  return DepthTarget(*this, width, height, format, sampled, samples);
 }
 inline DepthArrayImage Device::createDepthArray(uint32_t width, uint32_t height, uint32_t layers,
                                                 vk::Format format) {
