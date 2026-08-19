@@ -1,4 +1,3 @@
-enable_testing()
 if (WIN32) 
     set(GLFW_FOLDER "win32")
     set(SYS_LIB "")
@@ -26,6 +25,10 @@ include_directories(include ${Vulkan_INCLUDE_DIRS})
 link_directories(${CMAKE_CURRENT_SOURCE_DIR}/lib/${GLFW_FOLDER})
 
 file(GLOB_RECURSE source_files ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp)
+list(FILTER source_files EXCLUDE REGEX "/framegraph/")
 add_executable(vbktest ${source_files})
 target_link_libraries(vbktest ${Vulkan_LIBRARY} glfw3 ${SYS_LIB})
 target_link_options(vbktest PRIVATE ${LINK_OPT})
+
+# Headless frame-graph unit tests (no window, no GPU required).
+add_subdirectory(framegraph)

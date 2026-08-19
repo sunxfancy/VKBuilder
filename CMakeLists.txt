@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.15)
 project(VkBuilder)
+enable_testing()
 
 ## Version settings
 SET(VERSION_MAJOR "0")

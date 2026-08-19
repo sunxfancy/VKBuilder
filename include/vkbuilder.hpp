@@ -11,6 +11,17 @@
 #include <stdexcept>
 #include <utility>
 
+// Vulkan-Hpp >= 1.4 moved the dynamic dispatch loader classes (DispatchLoaderDynamic,
+// DynamicLoader) from the vk namespace into vk::detail. Re-export them at vk::
+// scope so vkbuilder compiles against both older (e.g. the 1.3.x header vendored by
+// EVEngine) and newer SDK headers.
+#if VK_HEADER_VERSION >= 357
+namespace vk {
+using detail::DispatchLoaderDynamic;
+using detail::DynamicLoader;
+} // namespace vk
+#endif
+
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
 #if TARGET_OS_IPHONE
@@ -247,7 +258,15 @@ static inline vk::DebugUtilsMessengerEXT create_debug_utils_messenger(
   messengerCreateInfo.pNext = nullptr;
   messengerCreateInfo.messageSeverity = severity;
   messengerCreateInfo.messageType = type;
+#if VK_HEADER_VERSION >= 357
+  // Vulkan-Hpp 1.4 types the callback with enum-class parameters; the C-style
+  // PFN_vkDebugUtilsMessengerCallbackEXT is ABI-compatible, so cast (the header
+  // itself performs the same cast).
+  messengerCreateInfo.pfnUserCallback =
+      reinterpret_cast<vk::PFN_DebugUtilsMessengerCallbackEXT>(debug_callback);
+#else
   messengerCreateInfo.pfnUserCallback = debug_callback;
+#endif
 
   return instance.createDebugUtilsMessengerEXT(messengerCreateInfo,
                                                allocation_callbacks, 
@@ -374,7 +393,13 @@ public:
     if (use_debug_messenger) {
       messengerCreateInfo.setMessageSeverity(debug_message_severity);
       messengerCreateInfo.setMessageType(debug_message_type);
+#if VK_HEADER_VERSION >= 357
+      messengerCreateInfo.setPfnUserCallback(
+          reinterpret_cast<vk::PFN_DebugUtilsMessengerCallbackEXT>(
+              debug_callback));
+#else
       messengerCreateInfo.setPfnUserCallback(debug_callback);
+#endif
       pNext_chain.push_back(
           reinterpret_cast<vk::BaseOutStructure *>(&messengerCreateInfo));
     }
@@ -4611,7 +4636,6 @@ inline DepthArrayImage Device::createDepthArray(uint32_t width, uint32_t height,
 }
 
 } // namespace vkb
-
 
 #if defined(VKB_IMPL)
 namespace vkb {
