@@ -179,4 +179,36 @@ int main() {
   }
 ```
 
+## FrameGraph（渲染图）
+
+从 `0.3` 起提供 `vkb::FrameGraph`（`include/vkbuilder/framegraph.hpp`，可选
+扩展，需显式 `#include "vkbuilder/framegraph.hpp"`）：
+用声明式资源依赖替换手工 pass 排序与 `begin/endSampledLayout` 隐式 layout
+管理，自动推导拓扑顺序与并行 layer、自动生成并合并 barrier、缓存复用
+`VkRenderPass`/`Framebuffer`/command buffer，并支持多线程并行录制。
+
+```cpp
+vkb::FrameGraph graph{&device, 2};
+auto scene = graph.createTexture("sceneColor", texDesc);
+graph.markOutput(scene);
+
+graph.addPass("gbuffer")
+    .colorAttachment(scene, vkb::AttachmentOp::clearColor(0, 0, 0, 1))
+    .sample(white)
+    .record([](vkb::FrameGraphPassContext &ctx) {
+        auto &cb = ctx.commandBuffer();
+        // ... draw ...
+    });
+graph.addPass("compose")
+    .sample(scene)
+    .record([](vkb::FrameGraphPassContext &ctx) { /* ... */ });
+
+graph.compile();
+graph.execute();   // acquire -> record -> submit -> present
+```
+
+详细设计（依赖推导、barrier 合并、并行录制模型、线程契约、限制与路线）见
+[`docs/framegraph.md`](docs/framegraph.md)。单元测试在 `test/framegraph/`，
+纯逻辑测试无需 GPU：`cmake --build <build> --target framegraph_test`。
+
 
