@@ -2854,10 +2854,10 @@ struct Present {
   // acquireForFrame(). Callers must then keep per-frame resources alive until
   // that slot's fence has signaled (see waitForFrameSlot / waitForAllFrames).
   bool synchronous_frames = true;
-  // Independent of swapchain image_count. Capping at 2 is required so
-  // available/finished semaphores are not reused while the presentation
-  // engine may still be waiting on them (a common TDR / driver-crash cause
-  // when CPU is faster than vsync and FIF == image_count).
+  // Independent of swapchain image_count. Available (acquire) semaphores are
+  // indexed by this count; submit-finished semaphores are indexed by the
+  // acquired swapchain image instead (see getFinishedSemaphore), so the WSI
+  // engine never observes a reused present-wait semaphore.
   uint32_t frames_in_flight = 2;
   // Invoked after this frame's submission has completed on the GPU, before
   // presentKHR. Setting a hook forces a fence wait for that frame even when
@@ -2927,8 +2927,16 @@ public:
     return available_semaphores[swapchain->current_frame];
   }
 
+  // Submit-finished semaphores are waited on by vkQueuePresentKHR, which
+  // signals nothing the host can wait on: a vkQueueSubmit fence does NOT cover
+  // the presentation engine's use, so reusing them by frame slot violates
+  // VUID-vkQueueSubmit-pSignalSemaphores-00067 whenever frames_in_flight <
+  // image_count (a classic driver-TDR source). Index by the ACQUIRED IMAGE
+  // instead: re-acquiring image i guarantees the previous presentation of i
+  // completed, so finished_semaphore[i] is safe to reuse. See
+  // https://docs.vulkan.org/guide/latest/swapchain_semaphore_reuse.html
   vk::Semaphore& getFinishedSemaphore() {
-    return finished_semaphore[swapchain->current_frame];
+    return finished_semaphore[acquired_image_index];
   }
 
   /// Block until the given frame slot's last submission has completed.
@@ -3028,13 +3036,17 @@ public:
     if (in_flight_fences.size() != frames_in_flight) {
       for (auto f : in_flight_fences)
         if (f) (*device)->destroyFence(f);
+      in_flight_fences = device->createFences(frames_in_flight);
+    }
+    if (available_semaphores.size() != frames_in_flight) {
       for (auto s : available_semaphores)
         if (s) (*device)->destroySemaphore(s);
+      available_semaphores = device->createSemaphores(frames_in_flight);
+    }
+    if (finished_semaphore.size() != swapchain->image_count) {
       for (auto s : finished_semaphore)
         if (s) (*device)->destroySemaphore(s);
-      in_flight_fences = device->createFences(frames_in_flight);
-      available_semaphores = device->createSemaphores(frames_in_flight);
-      finished_semaphore = device->createSemaphores(frames_in_flight);
+      finished_semaphore = device->createSemaphores(swapchain->image_count);
     }
     // Old aliases point at fences of retired swapchain images.
     image_in_flight.assign(swapchain->image_count, vk::Fence{});
@@ -3133,8 +3145,10 @@ public:
 private:
   Present buildHandle(vk::RenderPass render_pass, vk::ImageView depth_view) {
     Present cb{device, swapchain};
-    // Never match FIF to image_count: reusing a present-wait semaphore while
-    // the WSI engine still holds it is a well-known driver TDR.
+    // Keep the frame-slot count small (2): it bounds CPU/GPU overlap and the
+    // number of command buffers / fences / acquire semaphores. Present-wait
+    // semaphores are sized by image_count and indexed by the acquired image,
+    // so they are never reused while the WSI engine still holds them.
     cb.frames_in_flight = std::min(2u, std::max(1u, swapchain.image_count));
     if (swapchain.current_frame >= cb.frames_in_flight)
       swapchain.current_frame = 0;
@@ -3150,7 +3164,9 @@ private:
     // them on first overwrite and adds pointless first-frame waits).
     cb.image_in_flight.assign(swapchain.image_count, vk::Fence{});
     cb.available_semaphores = device.createSemaphores(cb.frames_in_flight);
-    cb.finished_semaphore = device.createSemaphores(cb.frames_in_flight);
+    // Present-wait semaphores follow the swapchain image count (see
+    // getFinishedSemaphore): reuse is keyed on re-acquiring the image.
+    cb.finished_semaphore = device.createSemaphores(swapchain.image_count);
 
     cb.graphics_queue = device.getQueue(QueueType::graphics);
     cb.present_queue = device.getQueue(QueueType::present);
