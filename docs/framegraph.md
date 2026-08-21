@@ -132,7 +132,11 @@ graph.record([](const std::vector<uint32_t> &layer,
 
 正确性依据：
 
-- 每个 pass 独占自己的 command buffer（pool 按帧槽分配，CB 按 pass 下标复用）；
+- **每个 pass 独占自己的 command buffer 和 command pool**：pool 按
+  (帧槽, pass) 一一分配，每个 CB 是该 pool 的唯一分配物。并发录制时，任意
+  两个 worker 不可能碰到同一个 pool——Vulkan 规范要求 command pool 是
+  external synchronization 对象（同一 pool 下发的任何 CB 都不能被多线程
+  并发 reset/begin/record/end），这里用结构保证而不是约定；
 - 同 layer 内没有依赖边，也没有需要跨 pass 的 barrier；
 - 所有 barrier 都写在“消费方”pass 的 CB 开头，且提交顺序 = 拓扑顺序，
   因此同一队列上语义正确；
@@ -145,6 +149,30 @@ graph.record([](const std::vector<uint32_t> &layer,
 - descriptor set 更新必须在 `record()` 之前完成（`vkUpdateDescriptorSets`
   默认非线程安全），或使用带锁的 pool；
 - 帧槽索引通过 `ctx.frameSlot()` 获取，用于索引每帧一份的 UBO / 顶点缓冲。
+
+### 生命周期强制（RecordCycle）
+
+`FrameGraph` 内部用一个 `fg::RecordCycle` 状态机（build → compile → record →
+submit，`submit()` 后回到 build）把上面的契约变成**调用者无法违反**的约束，
+违反时抛 `std::runtime_error` 而不是产生未定义行为：
+
+- 构建 API（`addPass` / `createTexture` / `createBuffer` / `import*` /
+  `markOutput`）在录制中、以及 `record()` 之后 `submit()` 之前被禁止；
+- `compile()` 后修改了图（构建 API）必须重新 `compile()`，否则 `record()`
+  抛错（防止录制旧计划）；
+- `record()` 要求本轮已 `compile()` 且上一轮已 `submit()`——每帧必须
+  `compile → record → submit` 一轮；
+- `record()` 不可重入、不可并发：`record()` 期间任何图操作、以及第二个线程
+  同时 `record()` 都会得到异常；
+- `record()` 的 executor 必须对每个 pass 恰好调用一次 `recordOne`：跳过、
+  重复（包括并发重复）都会抛错；executor 在 worker 未 join 前返回也会被
+  检测到。
+
+状态迁移与 per-pass 的“恰好一次”记账都用同一把短临界区 mutex 保护
+（每 pass 每帧只锁两次，绝不跨越 pass 回调持锁）。
+
+录制回调拿到的 `FrameGraphPassContext` 内部持 `const FrameGraph*`，因此从
+回调里**编译期**就无法调用任何构建/编译/录制 API——即使回调捕获了图对象。
 
 ## 6. 与现有 API 的关系
 
