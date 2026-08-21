@@ -55,6 +55,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <type_traits>
@@ -440,6 +441,151 @@ struct CompiledFrameGraph {
   }
 };
 
+/// @brief Enforces the FrameGraph lifecycle so callers cannot accidentally
+/// violate the recording-thread contract.
+///
+/// A graph moves through build -> compile -> record -> submit; the cycle
+/// restarts after submit(). Violations throw std::runtime_error instead of
+/// producing undefined behavior:
+///   * build APIs (addPass / createTexture / import* / markOutput) are
+///     forbidden while recording, and after record() until submit();
+///   * record() requires a compile() that has not been invalidated by a build
+///     mutation and that happened after the previous submit();
+///   * record() must claim every pass exactly once: a pass recorded twice
+///     (even concurrently) throws, and a pass skipped by the executor throws;
+///   * record() is not re-entrant and cannot run concurrently with itself
+///     (the second caller gets an exception, not a data race).
+///
+/// The state transitions and per-pass claim bookkeeping are mutex-protected,
+/// so the checks themselves are safe to run from multiple threads. The lock
+/// is held only for short transitions (once per pass per frame), never across
+/// a pass callback.
+class RecordCycle {
+public:
+  enum class Phase { kIdle, kCompiling, kCompiled, kRecording, kRecorded };
+
+  /// Called by graph-building APIs. Marks the compiled plan as stale.
+  void markDirty() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (phase_ == Phase::kCompiling)
+      throw std::runtime_error(
+          "FrameGraph: graph cannot be mutated while compile() is running");
+    if (phase_ == Phase::kRecording)
+      throw std::runtime_error(
+          "FrameGraph: graph cannot be mutated while recording");
+    if (phase_ == Phase::kRecorded)
+      throw std::runtime_error(
+          "FrameGraph: graph cannot be mutated after record(); call submit() first");
+    dirty_ = true;
+  }
+
+  /// Claim the compile phase for the duration of replanning, so record() (or
+  /// another compile()) cannot start while the plan is being rebuilt.
+  void beginCompile() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (phase_ == Phase::kCompiling || phase_ == Phase::kRecording ||
+        phase_ == Phase::kRecorded)
+      throw std::runtime_error(
+          "FrameGraph: compile() is not allowed while recording or after "
+          "record(); call submit() first, or while another compile() runs");
+    phase_ = Phase::kCompiling;
+  }
+
+  /// Transition from kCompiling to kCompiled (compile() finished cleanly).
+  void endCompile() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    phase_ = Phase::kCompiled;
+    dirty_ = false;
+  }
+
+  /// Abort compile() after an exception: drop back to kIdle so the next
+  /// compile() is not blocked.
+  void abortCompile() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    phase_ = Phase::kIdle;
+    dirty_ = true;
+  }
+
+  /// Enter kRecording for a plan with passCount passes and reset the
+  /// exactly-once state. Throws when compile() is missing or stale.
+  void beginRecord(size_t passCount) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (phase_ != Phase::kCompiled)
+      throw std::runtime_error(
+          "FrameGraph: record() requires compile() first (once per frame)");
+    if (dirty_)
+      throw std::runtime_error(
+          "FrameGraph: graph was modified after compile(); call compile() again");
+    phase_ = Phase::kRecording;
+    passStates_.assign(passCount, kPending);
+  }
+
+  /// Claim pass i for recording. Throws if the pass is already being recorded
+  /// (double recordOne, including from a second worker).
+  void claimPass(size_t i) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (i >= passStates_.size() || passStates_[i] != kPending)
+      throw std::runtime_error(
+          "FrameGraph: a pass was recorded more than once; the executor must "
+          "call recordOne exactly once per pass");
+    passStates_[i] = kRecording;
+  }
+
+  /// Mark pass i as fully recorded (called after recordOne returns).
+  void releasePass(size_t i) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (i < passStates_.size()) passStates_[i] = kDone;
+  }
+
+  /// Finish recording: every pass must have been claimed and released exactly
+  /// once. Throws if the executor skipped a pass or returned while a worker
+  /// was still recording (i.e. did not join its threads).
+  void endRecord() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (size_t i = 0; i < passStates_.size(); ++i) {
+      const uint32_t s = passStates_[i];
+      if (s != kDone)
+        throw std::runtime_error(
+            "FrameGraph: pass " + std::to_string(i) +
+            " was not fully recorded exactly once; the executor must call "
+            "recordOne once per pass and join its workers");
+    }
+    phase_ = Phase::kRecorded;
+  }
+
+  /// Abort after an exception during record(): force a fresh compile() before
+  /// the next record() attempt.
+  void abortRecord() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    phase_ = Phase::kIdle;
+    dirty_ = true;
+  }
+
+  /// After a successful submit, require compile() before the next record().
+  void submitted() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (phase_ != Phase::kRecorded)
+      throw std::runtime_error(
+          "FrameGraph: submit() requires a preceding record()");
+    phase_ = Phase::kIdle;
+  }
+
+  Phase phase() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return phase_;
+  }
+
+private:
+  static constexpr uint32_t kPending = 0;
+  static constexpr uint32_t kRecording = 1;
+  static constexpr uint32_t kDone = 2;
+
+  mutable std::mutex mutex_;
+  Phase phase_ = Phase::kIdle;
+  bool dirty_ = false;
+  std::vector<uint32_t> passStates_;
+};
+
 } // namespace fg
 
 // ---------------------------------------------------------------------------
@@ -463,6 +609,7 @@ public:
   // -- resources -----------------------------------------------------------
 
   TextureHandle createTexture(const std::string &name, const TextureDesc &desc) {
+    cycle_.markDirty();
     return addTexture(name, desc, false, false);
   }
 
@@ -470,6 +617,7 @@ public:
   /// engine). The graph never destroys the image/view.
   TextureHandle importTexture(const std::string &name, vk::Image image,
                               vk::ImageView view, const TextureDesc &desc) {
+    cycle_.markDirty();
     TextureHandle h = addTexture(name, desc, true, false);
     resources_[h.id].imported = true;
     auto &rt = resourcesRT_[h.id];
@@ -484,6 +632,7 @@ public:
   /// Import the swapchain. Calling this again after a swapchain recreate
   /// rebinds the same logical handle to the new images.
   TextureHandle importSwapchain(vkb::Swapchain &swapchain) {
+    cycle_.markDirty();
     swapchain_ = &swapchain;
     // Reuse an existing handle with the same name if present.
     for (size_t i = 0; i < resources_.size(); ++i) {
@@ -509,11 +658,13 @@ public:
   }
 
   BufferHandle createBuffer(const std::string &name, const BufferDesc &desc) {
+    cycle_.markDirty();
     return addBuffer(name, desc, false);
   }
 
   BufferHandle importBuffer(const std::string &name, vk::Buffer buffer,
                             const BufferDesc &desc) {
+    cycle_.markDirty();
     BufferHandle h = addBuffer(name, desc, true);
     auto &rt = resourcesRT_[h.id];
     rt.framesInFlight = 1;
@@ -526,9 +677,11 @@ public:
   /// Mark a resource as an output: culling keeps every pass on a path from an
   /// output. Swapchain images are outputs automatically.
   void markOutput(TextureHandle h) {
+    cycle_.markDirty();
     if (h.valid()) resources_[h.id].output = true;
   }
   void markOutput(BufferHandle h) {
+    cycle_.markDirty();
     if (h.valid()) resources_[h.id].output = true;
   }
 
@@ -665,6 +818,7 @@ private:
   bool hasAcquired_ = false;
   bool needsRecreate_ = false;
   bool destroyed_ = false;
+  fg::RecordCycle cycle_;
 };
 
 class FrameGraphPassBuilder {
@@ -731,7 +885,7 @@ private:
 struct FrameGraphPassContext {
   FrameSlot slot{};
   uint32_t passOrder = 0;
-  FrameGraph *graph = nullptr;
+  const FrameGraph *graph = nullptr;
   vk::CommandBuffer cmd{};
 
   vk::CommandBuffer &commandBuffer() { return cmd; }
@@ -796,6 +950,7 @@ inline BufferHandle FrameGraph::addBuffer(const std::string &name,
 
 inline FrameGraphPassBuilder FrameGraph::addPass(const std::string &name,
                                                  PassType type) {
+  cycle_.markDirty();
   fg::PassData pd;
   pd.name = name;
   pd.type = type;
@@ -1357,8 +1512,15 @@ inline std::shared_ptr<fg::CompiledFrameGraph> FrameGraph::compilePlan() {
 
 inline void FrameGraph::compile() {
   if (destroyed_) return;
-  compiled_ = compilePlan();
-  if (device_) materializeDeviceObjects(*compiled_);
+  cycle_.beginCompile();
+  try {
+    compiled_ = compilePlan();
+    if (device_) materializeDeviceObjects(*compiled_);
+    cycle_.endCompile();
+  } catch (...) {
+    cycle_.abortCompile();
+    throw;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1617,19 +1779,38 @@ inline void FrameGraph::materializeDeviceObjects(
     }
   }
 
-  // Command pools / buffers per frame slot.
+  // Command pools / buffers, indexed [frameSlot * passCount + passOrder].
+  // Every pass's command buffer is the sole allocation of its own pool, so
+  // concurrent recording never makes two threads touch the same pool — the
+  // Vulkan requirement that command pools are externally synchronized is
+  // satisfied structurally instead of by convention. Callers therefore cannot
+  // reintroduce the shared-pool race with any PassRecordExecutor, and each
+  // worker may reset/record/end its buffer without locking.
   const uint32_t slotCount =
       swapchain_ ? std::min(framesInFlight_, std::max(1u, swapchain_->image_count))
                  : std::max(1u, framesInFlight_);
-  pools_.resize(slotCount);
+  const size_t poolCount = size_t(slotCount) * plan.passes.size();
+  // The active pass set can shrink (culling removes passes); destroy pools
+  // that are no longer indexed before shrinking, so their command buffers are
+  // freed exactly once and no pool handle leaks.
+  for (size_t i = poolCount; i < pools_.size(); ++i) {
+    if (device_ && pools_[i]) {
+      (*device_)->destroyCommandPool(pools_[i], device_->allocation_callbacks);
+      pools_[i] = vk::CommandPool{};
+    }
+  }
+  pools_.resize(poolCount);
   cbs_.resize(slotCount);
   for (uint32_t s = 0; s < slotCount; ++s) {
-    if (!pools_[s])
-      pools_[s] = device_->createCommandPool();
-    if (cbs_[s].size() < plan.passes.size()) {
-      auto extra = device_->createCommandBuffers(
-          pools_[s], uint32_t(plan.passes.size() - cbs_[s].size()));
-      cbs_[s].insert(cbs_[s].end(), extra.begin(), extra.end());
+    cbs_[s].resize(plan.passes.size());
+    for (uint32_t p = 0; p < plan.passes.size(); ++p) {
+      const size_t idx = size_t(s) * plan.passes.size() + p;
+      if (!pools_[idx])
+        pools_[idx] = device_->createCommandPool();
+      if (!cbs_[s][p]) {
+        auto bufs = device_->createCommandBuffers(pools_[idx], 1);
+        cbs_[s][p] = bufs[0];
+      }
     }
   }
 
@@ -1749,12 +1930,17 @@ inline void FrameGraph::record(const PassRecordExecutor &executor) {
   if (!device_ || !compiled_)
     throw std::runtime_error("FrameGraph::record requires a device");
   const auto &plan = *compiled_;
+  cycle_.beginRecord(plan.passes.size());
 
   auto recordOne = [&](uint32_t order) {
     const auto &pass = plan.passes[order];
     vk::CommandBuffer cb = commandBufferFor(order);
     if (!cb) throw std::runtime_error("missing command buffer for pass");
-    cb.reset({});
+    // Implicit reset: the pool is created with
+    // VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, so begin() returns a
+    // recordable buffer even after a previous frame's submission. Each pass's
+    // command buffer is the sole allocation of its own pool (one pool per
+    // frame slot per pass), so concurrent recording never shares a pool.
     cb.begin(vk::CommandBufferBeginInfo{});
 
     if (!pass.barrier.empty()) {
@@ -1833,15 +2019,33 @@ inline void FrameGraph::record(const PassRecordExecutor &executor) {
     cb.end();
   };
 
-  if (executor) {
-    for (const auto &layer : plan.layers) executor(layer, recordOne);
-  } else {
-    for (uint32_t order = 0; order < plan.passes.size(); ++order)
-      recordOne(order);
+  // Exactly-once guard around the raw recorder: an executor that skips,
+  // duplicates, or races a pass is caught here (with a clean exception)
+  // instead of corrupting command pools / in-flight command buffers.
+  auto guardedRecordOne = [&](uint32_t order) {
+    if (order >= plan.passes.size())
+      throw std::runtime_error("FrameGraph::record: invalid pass order");
+    cycle_.claimPass(order);
+    recordOne(order);
+    cycle_.releasePass(order);
+  };
+
+  try {
+    if (executor) {
+      for (const auto &layer : plan.layers) executor(layer, guardedRecordOne);
+    } else {
+      for (uint32_t order = 0; order < plan.passes.size(); ++order)
+        guardedRecordOne(order);
+    }
+    cycle_.endRecord();
+  } catch (...) {
+    cycle_.abortRecord();
+    throw;
   }
 }
 
 inline void FrameGraph::submit() {
+  cycle_.submitted();
   if (!device_ || !compiled_) return;
   const auto &plan = *compiled_;
   std::vector<vk::CommandBuffer> cbs;
