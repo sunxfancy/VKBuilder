@@ -2,6 +2,19 @@
 #define VULKAN_HPP_DISPATCH_LOADER_DYNAMIC 1
 #include <vulkan/vulkan.hpp>
 
+#if defined(VKB_ENABLE_VMA)
+#if !defined(VKB_VMA_HEADER)
+#if __has_include(<vma/vk_mem_alloc.h>)
+#define VKB_VMA_HEADER <vma/vk_mem_alloc.h>
+#elif __has_include(<vulkan/vk_mem_alloc.h>)
+#define VKB_VMA_HEADER <vulkan/vk_mem_alloc.h>
+#else
+#error "VKB_ENABLE_VMA requires vk_mem_alloc.h"
+#endif
+#endif
+#include VKB_VMA_HEADER
+#endif
+
 #include <algorithm>
 #include <cstdint>
 #include <string>
@@ -1277,6 +1290,17 @@ struct Device : Agent<vk::Device> {
   vk::SurfaceKHR surface;
   QueueFamilies queue_families;
   DeviceCaps caps;
+#if defined(VKB_ENABLE_VMA)
+  // Non-owning. The application must keep the allocator alive until every
+  // VKBuilder resource created from this Device has been destroyed.
+  VmaAllocator vma_allocator = VK_NULL_HANDLE;
+
+  bool hasVmaAllocator() const { return vma_allocator != VK_NULL_HANDLE; }
+
+  /// Attach an application-owned allocator after the logical device exists.
+  /// It must outlive every VKBuilder resource created from this Device.
+  void attachVmaAllocator(VmaAllocator allocator) { vma_allocator = allocator; }
+#endif
 
   bool hasAnisotropy() const { return caps.samplerAnisotropy; }
   bool hasSwapchain() const { return caps.swapchain; }
@@ -3533,6 +3557,9 @@ struct GenericBuffer {
   vk::DeviceSize capacity = 0;
   vk::BufferUsageFlags usage_flags{};
   vk::MemoryPropertyFlags memory_flags{};
+#if defined(VKB_ENABLE_VMA)
+  VmaAllocation vma_allocation = VK_NULL_HANDLE;
+#endif
 
   GenericBuffer() {}
 
@@ -3560,6 +3587,9 @@ struct GenericBuffer {
     size = 0;
     capacity = 0;
     device = nullptr;
+#if defined(VKB_ENABLE_VMA)
+    vma_allocation = VK_NULL_HANDLE;
+#endif
   }
 
   void allocate(FrameSlot slot, vkb::Device& device, vk::BufferUsageFlags usage, vk::DeviceSize size, vk::MemoryPropertyFlags memflags = vk::MemoryPropertyFlagBits::eDeviceLocal)
@@ -3584,6 +3614,24 @@ struct GenericBuffer {
     ci.size = size;
     ci.usage = usage;
     ci.sharingMode = vk::SharingMode::eExclusive;
+#if defined(VKB_ENABLE_VMA)
+    if (device.hasVmaAllocator()) {
+      VmaAllocationCreateInfo allocationInfo{};
+      allocationInfo.requiredFlags = static_cast<VkMemoryPropertyFlags>(memflags);
+      VkBuffer rawBuffer = VK_NULL_HANDLE;
+      VmaAllocationInfo allocatedInfo{};
+      const VkResult result = vmaCreateBuffer(
+          device.vma_allocator,
+          reinterpret_cast<const VkBufferCreateInfo *>(&ci), &allocationInfo,
+          &rawBuffer, &vma_allocation, &allocatedInfo);
+      if (result != VK_SUCCESS)
+        throw std::runtime_error("VMA buffer allocation failed");
+      buffer = rawBuffer;
+      memory = allocatedInfo.deviceMemory;
+      capacity = size;
+      return;
+    }
+#endif
     buffer = device->createBuffer(ci, device.allocation_callbacks);
     capacity = size;
 
@@ -3602,6 +3650,9 @@ struct GenericBuffer {
   void steal(GenericBuffer &o) noexcept {
     buffer = o.buffer;
     memory = o.memory;
+#if defined(VKB_ENABLE_VMA)
+    vma_allocation = o.vma_allocation;
+#endif
     size = o.size;
     device = o.device;
     capacity = o.capacity;
@@ -3612,6 +3663,14 @@ struct GenericBuffer {
 
   void release() {
     if (!device) return;
+#if defined(VKB_ENABLE_VMA)
+    if (vma_allocation) {
+      vmaDestroyBuffer(device->vma_allocator, static_cast<VkBuffer>(buffer),
+                       vma_allocation);
+      detach();
+      return;
+    }
+#endif
     if (buffer) (*device)->destroyBuffer(buffer, (*device).allocation_callbacks);
     if (memory) (*device)->freeMemory(memory, (*device).allocation_callbacks);
     detach();
@@ -3661,6 +3720,18 @@ struct GenericBuffer {
   /// Host-visible write. `slot` must be this frame's FrameSlot (or gpuIdle after waitIdle).
   void updateLocal(FrameSlot slot, const void *value, vk::DeviceSize size) const {
     (void)slot;
+#if defined(VKB_ENABLE_VMA)
+    if (vma_allocation) {
+      void *ptr = nullptr;
+      const VkResult result =
+          vmaMapMemory(device->vma_allocator, vma_allocation, &ptr);
+      if (result != VK_SUCCESS)
+        throw std::runtime_error("VMA buffer map failed");
+      memcpy(ptr, value, static_cast<size_t>(size));
+      vmaUnmapMemory(device->vma_allocator, vma_allocation);
+      return;
+    }
+#endif
     void *ptr = (*device)->mapMemory(memory, 0, size, vk::MemoryMapFlags{});
     memcpy(ptr, value, (size_t)size);
     (*device)->unmapMemory(memory);
@@ -3676,15 +3747,49 @@ struct GenericBuffer {
     updateLocal(slot, (void*)&value, vk::DeviceSize(sizeof(Type)));
   }
 
-  void *map() const { return (*device)->mapMemory(memory, 0, size, vk::MemoryMapFlags{}); };
-  void unmap() const { return (*device)->unmapMemory(memory); };
+  void *map() const {
+#if defined(VKB_ENABLE_VMA)
+    if (vma_allocation) {
+      void *ptr = nullptr;
+      const VkResult result =
+          vmaMapMemory(device->vma_allocator, vma_allocation, &ptr);
+      if (result != VK_SUCCESS)
+        throw std::runtime_error("VMA buffer map failed");
+      return ptr;
+    }
+#endif
+    return (*device)->mapMemory(memory, 0, size, vk::MemoryMapFlags{});
+  };
+  void unmap() const {
+#if defined(VKB_ENABLE_VMA)
+    if (vma_allocation) {
+      vmaUnmapMemory(device->vma_allocator, vma_allocation);
+      return;
+    }
+#endif
+    (*device)->unmapMemory(memory);
+  };
 
   void flush() const {
+#if defined(VKB_ENABLE_VMA)
+    if (vma_allocation) {
+      vmaFlushAllocation(device->vma_allocator, vma_allocation, 0,
+                         VK_WHOLE_SIZE);
+      return;
+    }
+#endif
     vk::MappedMemoryRange mr{memory, 0, VK_WHOLE_SIZE};
     return (*device)->flushMappedMemoryRanges(mr);
   }
 
   void invalidate() const {
+#if defined(VKB_ENABLE_VMA)
+    if (vma_allocation) {
+      vmaInvalidateAllocation(device->vma_allocator, vma_allocation, 0,
+                              VK_WHOLE_SIZE);
+      return;
+    }
+#endif
     vk::MappedMemoryRange mr{memory, 0, VK_WHOLE_SIZE};
     return (*device)->invalidateMappedMemoryRanges(mr);
   }
