@@ -26,9 +26,16 @@ link_directories(${CMAKE_CURRENT_SOURCE_DIR}/lib/${GLFW_FOLDER})
 
 file(GLOB_RECURSE source_files ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp)
 list(FILTER source_files EXCLUDE REGEX "/framegraph/")
+list(FILTER source_files EXCLUDE REGEX "/vma_compile\\.cpp$")
 add_executable(vbktest ${source_files})
 target_link_libraries(vbktest ${Vulkan_LIBRARY} glfw3 ${SYS_LIB})
 target_link_options(vbktest PRIVATE ${LINK_OPT})
+
+# Compile-only API-shape coverage for the optional VMA integration. Keeping
+# this out of vbktest also prevents mixing VKB_ENABLE_VMA and non-VMA Device
+# layouts in one executable.
+add_library(vkb_vma_compile OBJECT vma_compile.cpp)
+target_include_directories(vkb_vma_compile PRIVATE include ${Vulkan_INCLUDE_DIRS})
 
 # Headless frame-graph unit tests (no window, no GPU required).
 add_subdirectory(framegraph)
