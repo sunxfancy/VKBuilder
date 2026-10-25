@@ -1277,6 +1277,7 @@ class RenderPassBuilder;
 class ColorAttachmentImage;
 class DepthTarget;
 class DepthArrayImage;
+class CubemapRenderTarget;
 
 /// Features actually enabled on this logical device (selector-stage tags).
 struct DeviceCaps {
@@ -1377,13 +1378,25 @@ struct Device : Agent<vk::Device> {
   PipelineLayoutBuilder createPipelineLayout() const;
   ColorAttachmentImage createColorTarget(uint32_t width, uint32_t height,
                                          vk::Format format = vk::Format::eR8G8B8A8Unorm,
-                                         vk::SampleCountFlagBits samples = vk::SampleCountFlagBits::e1);
+                                         vk::SampleCountFlagBits samples = vk::SampleCountFlagBits::e1,
+                                         vk::ImageUsageFlags extraUsage = {});
+  /// Color attachment that can also be a blit/copy destination (scene color, Canvas).
+  ColorAttachmentImage createCopyableColorTarget(uint32_t width, uint32_t height,
+                                                 vk::Format format = vk::Format::eR8G8B8A8Unorm);
   DepthTarget createDepthTarget(uint32_t width, uint32_t height,
                                 vk::Format format = vk::Format::eD32Sfloat,
                                 bool sampled = false,
                                 vk::SampleCountFlagBits samples = vk::SampleCountFlagBits::e1);
   DepthArrayImage createDepthArray(uint32_t width, uint32_t height, uint32_t layers,
                                    vk::Format format = vk::Format::eD32Sfloat);
+  CubemapRenderTarget createCubemapRenderTarget(
+      uint32_t size, uint32_t mipLevels = 1,
+      vk::Format format = vk::Format::eR16G16B16A16Sfloat,
+      vk::ImageUsageFlags usage = vk::ImageUsageFlagBits::eSampled |
+                                  vk::ImageUsageFlagBits::eTransferSrc |
+                                  vk::ImageUsageFlagBits::eTransferDst |
+                                  vk::ImageUsageFlagBits::eColorAttachment |
+                                  vk::ImageUsageFlagBits::eStorage);
 
   std::vector<vk::CommandBuffer> createCommandBuffers(vk::CommandPool pool, uint32_t count = 1) {
     vk::CommandBufferAllocateInfo allocInfo = {};
@@ -4226,12 +4239,18 @@ public:
 };
 
 /// An image to use as a colour buffer on a renderpass.
+///
+/// Single-sample targets also get `eSampled | eTransferSrc` so they can leave
+/// the pass as a shader-readable texture. Pass `extraUsage` (typically
+/// `eTransferDst` and/or `eStorage`) when the image is also a copy destination
+/// or a compute storage image — scene-color ping-pong and offscreen Canvas.
 class ColorAttachmentImage : public GenericImage {
 public:
   ColorAttachmentImage() {}
 
   ColorAttachmentImage(Device& device, uint32_t width, uint32_t height, vk::Format format = vk::Format::eR8G8B8A8Unorm,
-                       vk::SampleCountFlagBits samples = vk::SampleCountFlagBits::e1) {
+                       vk::SampleCountFlagBits samples = vk::SampleCountFlagBits::e1,
+                       vk::ImageUsageFlags extraUsage = {}) {
     vk::ImageCreateInfo info;
     info.flags = {};
 
@@ -4247,6 +4266,7 @@ public:
     info.usage = vk::ImageUsageFlagBits::eColorAttachment;
     if (samples == vk::SampleCountFlagBits::e1)
       info.usage |= vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eSampled;
+    info.usage |= extraUsage;
     info.sharingMode = vk::SharingMode::eExclusive;
     info.queueFamilyIndexCount = 0;
     info.pQueueFamilyIndices = nullptr;
@@ -4340,6 +4360,98 @@ private:
 };
 
 using Image2DArray = DepthArrayImage;
+
+/// Cube-compatible render / storage target (HDR reflection probes, IBL bake).
+///
+/// Default usage covers sampled + color-attachment + storage + transfer so a
+/// host can render a face, blit into a layer, and run a compute filter without
+/// falling back to raw `vk::UniqueImage` allocation. The primary view is a
+/// cube view over every mip/layer; `layerView` / `layerAttachment` expose
+/// single-face mip-0 views for framebuffer attachments.
+class CubemapRenderTarget : public GenericImage {
+public:
+  CubemapRenderTarget() {}
+
+  CubemapRenderTarget(
+      Device &device, uint32_t size, uint32_t mipLevels = 1,
+      vk::Format format = vk::Format::eR16G16B16A16Sfloat,
+      vk::ImageUsageFlags usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferSrc |
+                                  vk::ImageUsageFlagBits::eTransferDst |
+                                  vk::ImageUsageFlagBits::eColorAttachment |
+                                  vk::ImageUsageFlagBits::eStorage) {
+    if (size == 0 || mipLevels == 0)
+      throw std::runtime_error("CubemapRenderTarget: size and mipLevels must be non-zero");
+    vk::ImageCreateInfo info{};
+    info.flags = vk::ImageCreateFlagBits::eCubeCompatible;
+    info.imageType = vk::ImageType::e2D;
+    info.format = format;
+    info.extent = vk::Extent3D{size, size, 1U};
+    info.mipLevels = mipLevels;
+    info.arrayLayers = 6;
+    info.samples = vk::SampleCountFlagBits::e1;
+    info.tiling = vk::ImageTiling::eOptimal;
+    info.usage = usage;
+    info.sharingMode = vk::SharingMode::eExclusive;
+    info.initialLayout = vk::ImageLayout::eUndefined;
+    create(device, info, vk::ImageViewType::eCube, vk::ImageAspectFlagBits::eColor, false);
+
+    layerViews.resize(6);
+    for (uint32_t face = 0; face < 6; ++face) {
+      vk::ImageViewCreateInfo layerInfo{};
+      layerInfo.image = image();
+      layerInfo.viewType = vk::ImageViewType::e2D;
+      layerInfo.format = format;
+      layerInfo.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, face, 1};
+      layerViews[face] = device->createImageViewUnique(layerInfo);
+    }
+  }
+
+  bool valid() const { return static_cast<bool>(s.image); }
+  vk::ImageView cubeView() const { return imageView(); }
+  uint32_t faceCount() const { return uint32_t(layerViews.size()); }
+  uint32_t mipCount() const { return info().mipLevels; }
+  vk::Format format() const { return info().format; }
+  uint32_t faceSize() const { return info().extent.width; }
+
+  vk::ImageView layerView(uint32_t face) const {
+    if (face >= layerViews.size())
+      throw std::runtime_error("CubemapRenderTarget::layerView: face out of range");
+    return *layerViews[face];
+  }
+
+  AttachmentView layerAttachment(uint32_t face) const {
+    return AttachmentView{layerView(face), vk::ImageAspectFlagBits::eColor,
+                          vk::ImageLayout::eColorAttachmentOptimal};
+  }
+
+  /// Temporary cube view covering only mip 0 (compute filter sample source).
+  vk::UniqueImageView createBaseCubeView() const {
+    if (!device) throw std::runtime_error("CubemapRenderTarget::createBaseCubeView: empty");
+    vk::ImageViewCreateInfo viewInfo{};
+    viewInfo.image = image();
+    viewInfo.viewType = vk::ImageViewType::eCube;
+    viewInfo.format = info().format;
+    viewInfo.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 6};
+    return (*device)->createImageViewUnique(viewInfo);
+  }
+
+  /// Temporary 2D-array view for one mip (compute storage destination).
+  vk::UniqueImageView createMipArrayView(uint32_t mip) const {
+    if (!device) throw std::runtime_error("CubemapRenderTarget::createMipArrayView: empty");
+    if (mip >= info().mipLevels)
+      throw std::runtime_error("CubemapRenderTarget::createMipArrayView: mip out of range");
+    vk::ImageViewCreateInfo viewInfo{};
+    viewInfo.image = image();
+    viewInfo.viewType = vk::ImageViewType::e2DArray;
+    viewInfo.format = info().format;
+    viewInfo.subresourceRange = {vk::ImageAspectFlagBits::eColor, mip, 1, 0, 6};
+    return (*device)->createImageViewUnique(viewInfo);
+  }
+
+private:
+  std::vector<vk::UniqueImageView> layerViews;
+};
+
 
 /// A class to help build samplers.
 /// Samplers tell the shader stages how to sample an image.
@@ -4744,8 +4856,14 @@ inline PipelineLayoutBuilder Device::createPipelineLayout() const {
 }
 inline ColorAttachmentImage Device::createColorTarget(uint32_t width, uint32_t height,
                                                       vk::Format format,
-                                                      vk::SampleCountFlagBits samples) {
-  return ColorAttachmentImage(*this, width, height, format, samples);
+                                                      vk::SampleCountFlagBits samples,
+                                                      vk::ImageUsageFlags extraUsage) {
+  return ColorAttachmentImage(*this, width, height, format, samples, extraUsage);
+}
+inline ColorAttachmentImage Device::createCopyableColorTarget(uint32_t width, uint32_t height,
+                                                              vk::Format format) {
+  return ColorAttachmentImage(*this, width, height, format, vk::SampleCountFlagBits::e1,
+                              vk::ImageUsageFlagBits::eTransferDst);
 }
 inline DepthTarget Device::createDepthTarget(uint32_t width, uint32_t height, vk::Format format,
                                              bool sampled, vk::SampleCountFlagBits samples) {
@@ -4754,6 +4872,55 @@ inline DepthTarget Device::createDepthTarget(uint32_t width, uint32_t height, vk
 inline DepthArrayImage Device::createDepthArray(uint32_t width, uint32_t height, uint32_t layers,
                                                 vk::Format format) {
   return DepthArrayImage(*this, width, height, layers, format);
+}
+inline CubemapRenderTarget Device::createCubemapRenderTarget(uint32_t size, uint32_t mipLevels,
+                                                             vk::Format format,
+                                                             vk::ImageUsageFlags usage) {
+  return CubemapRenderTarget(*this, size, mipLevels, format, usage);
+}
+
+/// Record a color/depth image → host-visible buffer copy with layout restore.
+/// The destination buffer must already be large enough for `extent` at the
+/// image's texel size; a host-read barrier is inserted after the copy.
+inline void recordImageToBufferReadback(vk::CommandBuffer cb, vk::Image source, vk::Buffer destination,
+                                        vk::Extent2D extent, vk::ImageAspectFlags aspect, uint32_t layer,
+                                        vk::ImageLayout originalLayout) {
+  vk::ImageMemoryBarrier barrier{};
+  barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barrier.image = source;
+  barrier.subresourceRange = {aspect, 0, 1, layer, 1};
+  barrier.oldLayout = originalLayout;
+  barrier.newLayout = vk::ImageLayout::eTransferSrcOptimal;
+  const bool present = originalLayout == vk::ImageLayout::ePresentSrcKHR;
+  barrier.srcAccessMask =
+      present ? vk::AccessFlagBits::eColorAttachmentWrite
+              : vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+  barrier.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+  cb.pipelineBarrier(present ? vk::PipelineStageFlagBits::eColorAttachmentOutput
+                             : vk::PipelineStageFlagBits::eAllCommands,
+                     vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 0, nullptr, 1, &barrier);
+  vk::BufferImageCopy region{};
+  region.imageSubresource = {aspect, 0, layer, 1};
+  region.imageExtent = vk::Extent3D{extent.width, extent.height, 1};
+  cb.copyImageToBuffer(source, vk::ImageLayout::eTransferSrcOptimal, destination, region);
+  vk::BufferMemoryBarrier hostRead{};
+  hostRead.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  hostRead.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  hostRead.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+  hostRead.dstAccessMask = vk::AccessFlagBits::eHostRead;
+  hostRead.buffer = destination;
+  hostRead.offset = 0;
+  hostRead.size = VK_WHOLE_SIZE;
+  cb.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 0,
+                     nullptr, 1, &hostRead, 0, nullptr);
+  std::swap(barrier.oldLayout, barrier.newLayout);
+  barrier.srcAccessMask = vk::AccessFlagBits::eTransferRead;
+  barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead;
+  cb.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                     present ? vk::PipelineStageFlagBits::eBottomOfPipe
+                             : vk::PipelineStageFlagBits::eAllCommands,
+                     {}, 0, nullptr, 0, nullptr, 1, &barrier);
 }
 
 } // namespace vkb
