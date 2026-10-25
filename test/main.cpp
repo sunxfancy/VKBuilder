@@ -114,30 +114,28 @@ public:
     v[1].pos = {-0.5, -0.5}; v[1].color = {0,1,0};
     v[2].pos = {0.5, -0.5}; v[2].color = {0,0,1};
 
-    // create Vertex buffer
-    buffer.allocate<Vertex>(device, v);
+    buffer.allocate(vkb::FrameSlot::gpuIdle(), device, v);
   }
 
   void render() {
-    present.begin();
-    present.beginRenderPass(renderpass);
+    auto recording = present.begin();
+    if (!recording) return;
 
+    auto pass = recording.beginRenderPass(renderpass);
     vk::DeviceSize offset(0);
-    auto& cb = present.getCurrentCommandBuffer();
+    auto &cb = pass.commandBuffer();
     cb.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
     cb.bindVertexBuffers(0, 1, buffer, &offset);
     cb.draw(3, 1, 0, 0);
 
-    present.endRenderPass();
-    present.end();
-    present.drawFrame();
+    pass.endRenderPass().end().submitAndPresent();
   }
 
   vkb::Instance inst;
   vkb::Device device;
   vkb::Swapchain swapchain;
 
-  vk::RenderPass renderpass;
+  vkb::BuiltRenderPass renderpass;
   vk::Pipeline pipeline;
 
   vkb::Present present;
