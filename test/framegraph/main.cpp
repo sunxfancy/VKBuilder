@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <atomic>
+#if defined(_MSC_VER)
 #include <crtdbg.h>
+#endif
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
@@ -345,6 +347,7 @@ static void testDeviceSmoke() {
 }
 
 int main() {
+#if defined(_MSC_VER)
   // Route CRT error dialogs (heap corruption etc.) to stderr so headless CI
   // does not block on a message box.
   _CrtSetReportMode(_CRT_WARN, _CRTDBG_MODE_FILE);
@@ -353,6 +356,7 @@ int main() {
   _CrtSetReportFile(_CRT_WARN, _CRTDBG_FILE_STDERR);
   _CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
   _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+#endif
 
   testChainAndAttachmentFolding();
   testBarrierMerging();
