@@ -1517,6 +1517,8 @@ struct Swapchain : Agent<vk::SwapchainKHR> {
   vk::Device device;
   uint32_t image_count = 0;
   vk::Format image_format;
+  /** @brief Actual mode used at creation; render-thread diagnostics, valid until destroy. */
+  vk::PresentModeKHR present_mode = vk::PresentModeKHR::eFifo;
   vk::Extent2D extent = {0, 0};
 
   std::vector<vk::Image> swapchain_images;
@@ -1727,6 +1729,7 @@ public:
 
     swapchain.device = info.device;
     swapchain.image_format = surface_format.format;
+    swapchain.present_mode = swapchain_create_info.presentMode;
     swapchain.extent = extent;
     auto images = swapchain.get_images();
     if (images.empty()) {
@@ -2666,6 +2669,12 @@ public:
   PipelineBuilder& setColorBlending(vk::PipelineColorBlendStateCreateInfo color_blending) {
     use_default_color_blending = false;
     this->color_blending = color_blending;
+    if (color_blending.attachmentCount > 0 && color_blending.pAttachments) {
+      colorBlendAttachments.assign(color_blending.pAttachments,
+                                   color_blending.pAttachments + color_blending.attachmentCount);
+    } else {
+      colorBlendAttachments.clear();
+    }
     return *this;
   }
 
@@ -4116,6 +4125,7 @@ public:
     info.samples = samples;
     info.tiling = vk::ImageTiling::eOptimal;
     info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+    info.usage |= vk::ImageUsageFlagBits::eTransferSrc;
     if (sampled)
       info.usage |= vk::ImageUsageFlagBits::eSampled;
     info.sharingMode = vk::SharingMode::eExclusive;
@@ -4147,6 +4157,7 @@ public:
     info.samples = vk::SampleCountFlagBits::e1;
     info.tiling = vk::ImageTiling::eOptimal;
     info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment | vk::ImageUsageFlagBits::eSampled;
+    info.usage |= vk::ImageUsageFlagBits::eTransferSrc;
     info.sharingMode = vk::SharingMode::eExclusive;
     info.initialLayout = vk::ImageLayout::eUndefined;
     create(device, info, vk::ImageViewType::e2DArray, vk::ImageAspectFlagBits::eDepth, false);
