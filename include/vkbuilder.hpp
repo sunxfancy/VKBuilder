@@ -2,6 +2,19 @@
 #define VULKAN_HPP_DISPATCH_LOADER_DYNAMIC 1
 #include <vulkan/vulkan.hpp>
 
+#if defined(VKB_ENABLE_VMA)
+#if !defined(VKB_VMA_HEADER)
+#if __has_include(<vma/vk_mem_alloc.h>)
+#define VKB_VMA_HEADER <vma/vk_mem_alloc.h>
+#elif __has_include(<vulkan/vk_mem_alloc.h>)
+#define VKB_VMA_HEADER <vulkan/vk_mem_alloc.h>
+#else
+#error "VKB_ENABLE_VMA requires vk_mem_alloc.h"
+#endif
+#endif
+#include VKB_VMA_HEADER
+#endif
+
 #include <algorithm>
 #include <cstdint>
 #include <string>
@@ -10,6 +23,17 @@
 #include <functional>
 #include <stdexcept>
 #include <utility>
+
+// Vulkan-Hpp >= 1.4 moved the dynamic dispatch loader classes (DispatchLoaderDynamic,
+// DynamicLoader) from the vk namespace into vk::detail. Re-export them at vk::
+// scope so vkbuilder compiles against both older (e.g. the 1.3.x header vendored by
+// EVEngine) and newer SDK headers.
+#if VK_HEADER_VERSION >= 357
+namespace vk {
+using detail::DispatchLoaderDynamic;
+using detail::DynamicLoader;
+} // namespace vk
+#endif
 
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
@@ -247,7 +271,15 @@ static inline vk::DebugUtilsMessengerEXT create_debug_utils_messenger(
   messengerCreateInfo.pNext = nullptr;
   messengerCreateInfo.messageSeverity = severity;
   messengerCreateInfo.messageType = type;
+#if VK_HEADER_VERSION >= 357
+  // Vulkan-Hpp 1.4 types the callback with enum-class parameters; the C-style
+  // PFN_vkDebugUtilsMessengerCallbackEXT is ABI-compatible, so cast (the header
+  // itself performs the same cast).
+  messengerCreateInfo.pfnUserCallback =
+      reinterpret_cast<vk::PFN_DebugUtilsMessengerCallbackEXT>(debug_callback);
+#else
   messengerCreateInfo.pfnUserCallback = debug_callback;
+#endif
 
   return instance.createDebugUtilsMessengerEXT(messengerCreateInfo,
                                                allocation_callbacks, 
@@ -374,7 +406,13 @@ public:
     if (use_debug_messenger) {
       messengerCreateInfo.setMessageSeverity(debug_message_severity);
       messengerCreateInfo.setMessageType(debug_message_type);
+#if VK_HEADER_VERSION >= 357
+      messengerCreateInfo.setPfnUserCallback(
+          reinterpret_cast<vk::PFN_DebugUtilsMessengerCallbackEXT>(
+              debug_callback));
+#else
       messengerCreateInfo.setPfnUserCallback(debug_callback);
+#endif
       pNext_chain.push_back(
           reinterpret_cast<vk::BaseOutStructure *>(&messengerCreateInfo));
     }
@@ -1239,6 +1277,7 @@ class RenderPassBuilder;
 class ColorAttachmentImage;
 class DepthTarget;
 class DepthArrayImage;
+class CubemapRenderTarget;
 
 /// Features actually enabled on this logical device (selector-stage tags).
 struct DeviceCaps {
@@ -1252,6 +1291,17 @@ struct Device : Agent<vk::Device> {
   vk::SurfaceKHR surface;
   QueueFamilies queue_families;
   DeviceCaps caps;
+#if defined(VKB_ENABLE_VMA)
+  // Non-owning. The application must keep the allocator alive until every
+  // VKBuilder resource created from this Device has been destroyed.
+  VmaAllocator vma_allocator = VK_NULL_HANDLE;
+
+  bool hasVmaAllocator() const { return vma_allocator != VK_NULL_HANDLE; }
+
+  /// Attach an application-owned allocator after the logical device exists.
+  /// It must outlive every VKBuilder resource created from this Device.
+  void attachVmaAllocator(VmaAllocator allocator) { vma_allocator = allocator; }
+#endif
 
   bool hasAnisotropy() const { return caps.samplerAnisotropy; }
   bool hasSwapchain() const { return caps.swapchain; }
@@ -1328,13 +1378,25 @@ struct Device : Agent<vk::Device> {
   PipelineLayoutBuilder createPipelineLayout() const;
   ColorAttachmentImage createColorTarget(uint32_t width, uint32_t height,
                                          vk::Format format = vk::Format::eR8G8B8A8Unorm,
-                                         vk::SampleCountFlagBits samples = vk::SampleCountFlagBits::e1);
+                                         vk::SampleCountFlagBits samples = vk::SampleCountFlagBits::e1,
+                                         vk::ImageUsageFlags extraUsage = {});
+  /// Color attachment that can also be a blit/copy destination (scene color, Canvas).
+  ColorAttachmentImage createCopyableColorTarget(uint32_t width, uint32_t height,
+                                                 vk::Format format = vk::Format::eR8G8B8A8Unorm);
   DepthTarget createDepthTarget(uint32_t width, uint32_t height,
                                 vk::Format format = vk::Format::eD32Sfloat,
                                 bool sampled = false,
                                 vk::SampleCountFlagBits samples = vk::SampleCountFlagBits::e1);
   DepthArrayImage createDepthArray(uint32_t width, uint32_t height, uint32_t layers,
                                    vk::Format format = vk::Format::eD32Sfloat);
+  CubemapRenderTarget createCubemapRenderTarget(
+      uint32_t size, uint32_t mipLevels = 1,
+      vk::Format format = vk::Format::eR16G16B16A16Sfloat,
+      vk::ImageUsageFlags usage = vk::ImageUsageFlagBits::eSampled |
+                                  vk::ImageUsageFlagBits::eTransferSrc |
+                                  vk::ImageUsageFlagBits::eTransferDst |
+                                  vk::ImageUsageFlagBits::eColorAttachment |
+                                  vk::ImageUsageFlagBits::eStorage);
 
   std::vector<vk::CommandBuffer> createCommandBuffers(vk::CommandPool pool, uint32_t count = 1) {
     vk::CommandBufferAllocateInfo allocInfo = {};
@@ -1998,7 +2060,11 @@ struct AttachmentView {
 /// Render pass plus the attachment signature pipelines and framebuffers must match.
 struct BuiltRenderPass {
   vk::RenderPass handle{};
+  /// Subpass color attachments (not including resolve targets). Pipelines must
+  /// match this count, not the total VkAttachmentDescription count.
   uint32_t colorAttachmentCount = 0;
+  /// 1x resolve targets paired with multisampled color attachments.
+  uint32_t resolveAttachmentCount = 0;
   bool hasDepth = false;
   bool colorsSampledAfter = false;
   bool depthSampledAfter = false;
@@ -2008,7 +2074,9 @@ struct BuiltRenderPass {
   operator vk::RenderPass() const { return handle; }
   explicit operator bool() const { return static_cast<bool>(handle); }
 
-  uint32_t attachmentCount() const { return colorAttachmentCount + (hasDepth ? 1u : 0u); }
+  uint32_t attachmentCount() const {
+    return colorAttachmentCount + resolveAttachmentCount + (hasDepth ? 1u : 0u);
+  }
 
   vk::Framebuffer createFramebuffer(const Device &device, uint32_t width, uint32_t height,
                                     const std::vector<vk::ImageView> &views) const {
@@ -2088,6 +2156,7 @@ public:
     BuiltRenderPass out;
     out.handle = device->createRenderPass(info, device.allocation_callbacks);
     out.colorAttachmentCount = colorCount;
+    out.resolveAttachmentCount = resolveCount;
     out.hasDepth = hasDepthAtt;
     out.colorsSampledAfter = colorsSampledAfter;
     out.depthSampledAfter = depthSampledAfter;
@@ -2135,9 +2204,11 @@ public:
   }
 
   /// 1x resolved color attachment for a multisampled render pass. Becomes a SampledImage.
+  /// loadOp defaults to DONT_CARE: the resolve overwrites the image, and CLEAR
+  /// on the resolve target crashes MoltenVK/Metal.
   RenderPassBuilder& addResolveColorAttachment(
       vk::Format image_format,
-      vk::AttachmentLoadOp loadOp = vk::AttachmentLoadOp::eClear) {
+      vk::AttachmentLoadOp loadOp = vk::AttachmentLoadOp::eDontCare) {
     attachments.push_back(
       vk::AttachmentDescription()
         .setFormat(image_format)
@@ -2149,7 +2220,7 @@ public:
         .setInitialLayout(vk::ImageLayout::eUndefined)
         .setFinalLayout(vk::ImageLayout::eShaderReadOnlyOptimal)
     );
-    ++colorCount;
+    ++resolveCount;
     colorsSampledAfter = true;
     colorFinalLayout = vk::ImageLayout::eShaderReadOnlyOptimal;
     return *this;
@@ -2260,6 +2331,7 @@ private:
   std::vector<vk::AttachmentReference> resolveRefs;
   std::vector<vk::SubpassDependency> dependencies;
   uint32_t colorCount = 0;
+  uint32_t resolveCount = 0;
   bool hasDepthAtt = false;
   bool colorsSampledAfter = false;
   bool depthSampledAfter = false;
@@ -2828,10 +2900,10 @@ struct Present {
   // acquireForFrame(). Callers must then keep per-frame resources alive until
   // that slot's fence has signaled (see waitForFrameSlot / waitForAllFrames).
   bool synchronous_frames = true;
-  // Independent of swapchain image_count. Capping at 2 is required so
-  // available/finished semaphores are not reused while the presentation
-  // engine may still be waiting on them (a common TDR / driver-crash cause
-  // when CPU is faster than vsync and FIF == image_count).
+  // Independent of swapchain image_count. Available (acquire) semaphores are
+  // indexed by this count; submit-finished semaphores are indexed by the
+  // acquired swapchain image instead (see getFinishedSemaphore), so the WSI
+  // engine never observes a reused present-wait semaphore.
   uint32_t frames_in_flight = 2;
   // Invoked after this frame's submission has completed on the GPU, before
   // presentKHR. Setting a hook forces a fence wait for that frame even when
@@ -2901,8 +2973,16 @@ public:
     return available_semaphores[swapchain->current_frame];
   }
 
+  // Submit-finished semaphores are waited on by vkQueuePresentKHR, which
+  // signals nothing the host can wait on: a vkQueueSubmit fence does NOT cover
+  // the presentation engine's use, so reusing them by frame slot violates
+  // VUID-vkQueueSubmit-pSignalSemaphores-00067 whenever frames_in_flight <
+  // image_count (a classic driver-TDR source). Index by the ACQUIRED IMAGE
+  // instead: re-acquiring image i guarantees the previous presentation of i
+  // completed, so finished_semaphore[i] is safe to reuse. See
+  // https://docs.vulkan.org/guide/latest/swapchain_semaphore_reuse.html
   vk::Semaphore& getFinishedSemaphore() {
-    return finished_semaphore[swapchain->current_frame];
+    return finished_semaphore[acquired_image_index];
   }
 
   /// Block until the given frame slot's last submission has completed.
@@ -3002,13 +3082,17 @@ public:
     if (in_flight_fences.size() != frames_in_flight) {
       for (auto f : in_flight_fences)
         if (f) (*device)->destroyFence(f);
+      in_flight_fences = device->createFences(frames_in_flight);
+    }
+    if (available_semaphores.size() != frames_in_flight) {
       for (auto s : available_semaphores)
         if (s) (*device)->destroySemaphore(s);
+      available_semaphores = device->createSemaphores(frames_in_flight);
+    }
+    if (finished_semaphore.size() != swapchain->image_count) {
       for (auto s : finished_semaphore)
         if (s) (*device)->destroySemaphore(s);
-      in_flight_fences = device->createFences(frames_in_flight);
-      available_semaphores = device->createSemaphores(frames_in_flight);
-      finished_semaphore = device->createSemaphores(frames_in_flight);
+      finished_semaphore = device->createSemaphores(swapchain->image_count);
     }
     // Old aliases point at fences of retired swapchain images.
     image_in_flight.assign(swapchain->image_count, vk::Fence{});
@@ -3107,8 +3191,10 @@ public:
 private:
   Present buildHandle(vk::RenderPass render_pass, vk::ImageView depth_view) {
     Present cb{device, swapchain};
-    // Never match FIF to image_count: reusing a present-wait semaphore while
-    // the WSI engine still holds it is a well-known driver TDR.
+    // Keep the frame-slot count small (2): it bounds CPU/GPU overlap and the
+    // number of command buffers / fences / acquire semaphores. Present-wait
+    // semaphores are sized by image_count and indexed by the acquired image,
+    // so they are never reused while the WSI engine still holds them.
     cb.frames_in_flight = std::min(2u, std::max(1u, swapchain.image_count));
     if (swapchain.current_frame >= cb.frames_in_flight)
       swapchain.current_frame = 0;
@@ -3124,7 +3210,9 @@ private:
     // them on first overwrite and adds pointless first-frame waits).
     cb.image_in_flight.assign(swapchain.image_count, vk::Fence{});
     cb.available_semaphores = device.createSemaphores(cb.frames_in_flight);
-    cb.finished_semaphore = device.createSemaphores(cb.frames_in_flight);
+    // Present-wait semaphores follow the swapchain image count (see
+    // getFinishedSemaphore): reuse is keyed on re-acquiring the image.
+    cb.finished_semaphore = device.createSemaphores(swapchain.image_count);
 
     cb.graphics_queue = device.getQueue(QueueType::graphics);
     cb.present_queue = device.getQueue(QueueType::present);
@@ -3491,6 +3579,9 @@ struct GenericBuffer {
   vk::DeviceSize capacity = 0;
   vk::BufferUsageFlags usage_flags{};
   vk::MemoryPropertyFlags memory_flags{};
+#if defined(VKB_ENABLE_VMA)
+  VmaAllocation vma_allocation = VK_NULL_HANDLE;
+#endif
 
   GenericBuffer() {}
 
@@ -3518,6 +3609,9 @@ struct GenericBuffer {
     size = 0;
     capacity = 0;
     device = nullptr;
+#if defined(VKB_ENABLE_VMA)
+    vma_allocation = VK_NULL_HANDLE;
+#endif
   }
 
   void allocate(FrameSlot slot, vkb::Device& device, vk::BufferUsageFlags usage, vk::DeviceSize size, vk::MemoryPropertyFlags memflags = vk::MemoryPropertyFlagBits::eDeviceLocal)
@@ -3542,6 +3636,24 @@ struct GenericBuffer {
     ci.size = size;
     ci.usage = usage;
     ci.sharingMode = vk::SharingMode::eExclusive;
+#if defined(VKB_ENABLE_VMA)
+    if (device.hasVmaAllocator()) {
+      VmaAllocationCreateInfo allocationInfo{};
+      allocationInfo.requiredFlags = static_cast<VkMemoryPropertyFlags>(memflags);
+      VkBuffer rawBuffer = VK_NULL_HANDLE;
+      VmaAllocationInfo allocatedInfo{};
+      const VkResult result = vmaCreateBuffer(
+          device.vma_allocator,
+          reinterpret_cast<const VkBufferCreateInfo *>(&ci), &allocationInfo,
+          &rawBuffer, &vma_allocation, &allocatedInfo);
+      if (result != VK_SUCCESS)
+        throw std::runtime_error("VMA buffer allocation failed");
+      buffer = rawBuffer;
+      memory = allocatedInfo.deviceMemory;
+      capacity = size;
+      return;
+    }
+#endif
     buffer = device->createBuffer(ci, device.allocation_callbacks);
     capacity = size;
 
@@ -3560,6 +3672,9 @@ struct GenericBuffer {
   void steal(GenericBuffer &o) noexcept {
     buffer = o.buffer;
     memory = o.memory;
+#if defined(VKB_ENABLE_VMA)
+    vma_allocation = o.vma_allocation;
+#endif
     size = o.size;
     device = o.device;
     capacity = o.capacity;
@@ -3570,6 +3685,14 @@ struct GenericBuffer {
 
   void release() {
     if (!device) return;
+#if defined(VKB_ENABLE_VMA)
+    if (vma_allocation) {
+      vmaDestroyBuffer(device->vma_allocator, static_cast<VkBuffer>(buffer),
+                       vma_allocation);
+      detach();
+      return;
+    }
+#endif
     if (buffer) (*device)->destroyBuffer(buffer, (*device).allocation_callbacks);
     if (memory) (*device)->freeMemory(memory, (*device).allocation_callbacks);
     detach();
@@ -3619,6 +3742,18 @@ struct GenericBuffer {
   /// Host-visible write. `slot` must be this frame's FrameSlot (or gpuIdle after waitIdle).
   void updateLocal(FrameSlot slot, const void *value, vk::DeviceSize size) const {
     (void)slot;
+#if defined(VKB_ENABLE_VMA)
+    if (vma_allocation) {
+      void *ptr = nullptr;
+      const VkResult result =
+          vmaMapMemory(device->vma_allocator, vma_allocation, &ptr);
+      if (result != VK_SUCCESS)
+        throw std::runtime_error("VMA buffer map failed");
+      memcpy(ptr, value, static_cast<size_t>(size));
+      vmaUnmapMemory(device->vma_allocator, vma_allocation);
+      return;
+    }
+#endif
     void *ptr = (*device)->mapMemory(memory, 0, size, vk::MemoryMapFlags{});
     memcpy(ptr, value, (size_t)size);
     (*device)->unmapMemory(memory);
@@ -3634,15 +3769,49 @@ struct GenericBuffer {
     updateLocal(slot, (void*)&value, vk::DeviceSize(sizeof(Type)));
   }
 
-  void *map() const { return (*device)->mapMemory(memory, 0, size, vk::MemoryMapFlags{}); };
-  void unmap() const { return (*device)->unmapMemory(memory); };
+  void *map() const {
+#if defined(VKB_ENABLE_VMA)
+    if (vma_allocation) {
+      void *ptr = nullptr;
+      const VkResult result =
+          vmaMapMemory(device->vma_allocator, vma_allocation, &ptr);
+      if (result != VK_SUCCESS)
+        throw std::runtime_error("VMA buffer map failed");
+      return ptr;
+    }
+#endif
+    return (*device)->mapMemory(memory, 0, size, vk::MemoryMapFlags{});
+  };
+  void unmap() const {
+#if defined(VKB_ENABLE_VMA)
+    if (vma_allocation) {
+      vmaUnmapMemory(device->vma_allocator, vma_allocation);
+      return;
+    }
+#endif
+    (*device)->unmapMemory(memory);
+  };
 
   void flush() const {
+#if defined(VKB_ENABLE_VMA)
+    if (vma_allocation) {
+      vmaFlushAllocation(device->vma_allocator, vma_allocation, 0,
+                         VK_WHOLE_SIZE);
+      return;
+    }
+#endif
     vk::MappedMemoryRange mr{memory, 0, VK_WHOLE_SIZE};
     return (*device)->flushMappedMemoryRanges(mr);
   }
 
   void invalidate() const {
+#if defined(VKB_ENABLE_VMA)
+    if (vma_allocation) {
+      vmaInvalidateAllocation(device->vma_allocator, vma_allocation, 0,
+                              VK_WHOLE_SIZE);
+      return;
+    }
+#endif
     vk::MappedMemoryRange mr{memory, 0, VK_WHOLE_SIZE};
     return (*device)->invalidateMappedMemoryRanges(mr);
   }
@@ -4079,12 +4248,18 @@ public:
 };
 
 /// An image to use as a colour buffer on a renderpass.
+///
+/// Single-sample targets also get `eSampled | eTransferSrc` so they can leave
+/// the pass as a shader-readable texture. Pass `extraUsage` (typically
+/// `eTransferDst` and/or `eStorage`) when the image is also a copy destination
+/// or a compute storage image — scene-color ping-pong and offscreen Canvas.
 class ColorAttachmentImage : public GenericImage {
 public:
   ColorAttachmentImage() {}
 
   ColorAttachmentImage(Device& device, uint32_t width, uint32_t height, vk::Format format = vk::Format::eR8G8B8A8Unorm,
-                       vk::SampleCountFlagBits samples = vk::SampleCountFlagBits::e1) {
+                       vk::SampleCountFlagBits samples = vk::SampleCountFlagBits::e1,
+                       vk::ImageUsageFlags extraUsage = {}) {
     vk::ImageCreateInfo info;
     info.flags = {};
 
@@ -4095,7 +4270,12 @@ public:
     info.arrayLayers = 1;
     info.samples = samples;
     info.tiling = vk::ImageTiling::eOptimal;
-    info.usage = vk::ImageUsageFlagBits::eColorAttachment|vk::ImageUsageFlagBits::eTransferSrc|vk::ImageUsageFlagBits::eSampled;
+    // MSAA targets are resolve sources only. SAMPLED/TRANSFER on a multisample
+    // image is rejected or crashes later on MoltenVK/Metal.
+    info.usage = vk::ImageUsageFlagBits::eColorAttachment;
+    if (samples == vk::SampleCountFlagBits::e1)
+      info.usage |= vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eSampled;
+    info.usage |= extraUsage;
     info.sharingMode = vk::SharingMode::eExclusive;
     info.queueFamilyIndexCount = 0;
     info.pQueueFamilyIndices = nullptr;
@@ -4191,6 +4371,98 @@ private:
 };
 
 using Image2DArray = DepthArrayImage;
+
+/// Cube-compatible render / storage target (HDR reflection probes, IBL bake).
+///
+/// Default usage covers sampled + color-attachment + storage + transfer so a
+/// host can render a face, blit into a layer, and run a compute filter without
+/// falling back to raw `vk::UniqueImage` allocation. The primary view is a
+/// cube view over every mip/layer; `layerView` / `layerAttachment` expose
+/// single-face mip-0 views for framebuffer attachments.
+class CubemapRenderTarget : public GenericImage {
+public:
+  CubemapRenderTarget() {}
+
+  CubemapRenderTarget(
+      Device &device, uint32_t size, uint32_t mipLevels = 1,
+      vk::Format format = vk::Format::eR16G16B16A16Sfloat,
+      vk::ImageUsageFlags usage = vk::ImageUsageFlagBits::eSampled | vk::ImageUsageFlagBits::eTransferSrc |
+                                  vk::ImageUsageFlagBits::eTransferDst |
+                                  vk::ImageUsageFlagBits::eColorAttachment |
+                                  vk::ImageUsageFlagBits::eStorage) {
+    if (size == 0 || mipLevels == 0)
+      throw std::runtime_error("CubemapRenderTarget: size and mipLevels must be non-zero");
+    vk::ImageCreateInfo info{};
+    info.flags = vk::ImageCreateFlagBits::eCubeCompatible;
+    info.imageType = vk::ImageType::e2D;
+    info.format = format;
+    info.extent = vk::Extent3D{size, size, 1U};
+    info.mipLevels = mipLevels;
+    info.arrayLayers = 6;
+    info.samples = vk::SampleCountFlagBits::e1;
+    info.tiling = vk::ImageTiling::eOptimal;
+    info.usage = usage;
+    info.sharingMode = vk::SharingMode::eExclusive;
+    info.initialLayout = vk::ImageLayout::eUndefined;
+    create(device, info, vk::ImageViewType::eCube, vk::ImageAspectFlagBits::eColor, false);
+
+    layerViews.resize(6);
+    for (uint32_t face = 0; face < 6; ++face) {
+      vk::ImageViewCreateInfo layerInfo{};
+      layerInfo.image = image();
+      layerInfo.viewType = vk::ImageViewType::e2D;
+      layerInfo.format = format;
+      layerInfo.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, face, 1};
+      layerViews[face] = device->createImageViewUnique(layerInfo);
+    }
+  }
+
+  bool valid() const { return static_cast<bool>(s.image); }
+  vk::ImageView cubeView() const { return imageView(); }
+  uint32_t faceCount() const { return uint32_t(layerViews.size()); }
+  uint32_t mipCount() const { return info().mipLevels; }
+  vk::Format format() const { return info().format; }
+  uint32_t faceSize() const { return info().extent.width; }
+
+  vk::ImageView layerView(uint32_t face) const {
+    if (face >= layerViews.size())
+      throw std::runtime_error("CubemapRenderTarget::layerView: face out of range");
+    return *layerViews[face];
+  }
+
+  AttachmentView layerAttachment(uint32_t face) const {
+    return AttachmentView{layerView(face), vk::ImageAspectFlagBits::eColor,
+                          vk::ImageLayout::eColorAttachmentOptimal};
+  }
+
+  /// Temporary cube view covering only mip 0 (compute filter sample source).
+  vk::UniqueImageView createBaseCubeView() const {
+    if (!device) throw std::runtime_error("CubemapRenderTarget::createBaseCubeView: empty");
+    vk::ImageViewCreateInfo viewInfo{};
+    viewInfo.image = image();
+    viewInfo.viewType = vk::ImageViewType::eCube;
+    viewInfo.format = info().format;
+    viewInfo.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 6};
+    return (*device)->createImageViewUnique(viewInfo);
+  }
+
+  /// Temporary 2D-array view for one mip (compute storage destination).
+  vk::UniqueImageView createMipArrayView(uint32_t mip) const {
+    if (!device) throw std::runtime_error("CubemapRenderTarget::createMipArrayView: empty");
+    if (mip >= info().mipLevels)
+      throw std::runtime_error("CubemapRenderTarget::createMipArrayView: mip out of range");
+    vk::ImageViewCreateInfo viewInfo{};
+    viewInfo.image = image();
+    viewInfo.viewType = vk::ImageViewType::e2DArray;
+    viewInfo.format = info().format;
+    viewInfo.subresourceRange = {vk::ImageAspectFlagBits::eColor, mip, 1, 0, 6};
+    return (*device)->createImageViewUnique(viewInfo);
+  }
+
+private:
+  std::vector<vk::UniqueImageView> layerViews;
+};
+
 
 /// A class to help build samplers.
 /// Samplers tell the shader stages how to sample an image.
@@ -4595,8 +4867,14 @@ inline PipelineLayoutBuilder Device::createPipelineLayout() const {
 }
 inline ColorAttachmentImage Device::createColorTarget(uint32_t width, uint32_t height,
                                                       vk::Format format,
-                                                      vk::SampleCountFlagBits samples) {
-  return ColorAttachmentImage(*this, width, height, format, samples);
+                                                      vk::SampleCountFlagBits samples,
+                                                      vk::ImageUsageFlags extraUsage) {
+  return ColorAttachmentImage(*this, width, height, format, samples, extraUsage);
+}
+inline ColorAttachmentImage Device::createCopyableColorTarget(uint32_t width, uint32_t height,
+                                                              vk::Format format) {
+  return ColorAttachmentImage(*this, width, height, format, vk::SampleCountFlagBits::e1,
+                              vk::ImageUsageFlagBits::eTransferDst);
 }
 inline DepthTarget Device::createDepthTarget(uint32_t width, uint32_t height, vk::Format format,
                                              bool sampled, vk::SampleCountFlagBits samples) {
@@ -4606,9 +4884,57 @@ inline DepthArrayImage Device::createDepthArray(uint32_t width, uint32_t height,
                                                 vk::Format format) {
   return DepthArrayImage(*this, width, height, layers, format);
 }
+inline CubemapRenderTarget Device::createCubemapRenderTarget(uint32_t size, uint32_t mipLevels,
+                                                             vk::Format format,
+                                                             vk::ImageUsageFlags usage) {
+  return CubemapRenderTarget(*this, size, mipLevels, format, usage);
+}
+
+/// Record a color/depth image → host-visible buffer copy with layout restore.
+/// The destination buffer must already be large enough for `extent` at the
+/// image's texel size; a host-read barrier is inserted after the copy.
+inline void recordImageToBufferReadback(vk::CommandBuffer cb, vk::Image source, vk::Buffer destination,
+                                        vk::Extent2D extent, vk::ImageAspectFlags aspect, uint32_t layer,
+                                        vk::ImageLayout originalLayout) {
+  vk::ImageMemoryBarrier barrier{};
+  barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barrier.image = source;
+  barrier.subresourceRange = {aspect, 0, 1, layer, 1};
+  barrier.oldLayout = originalLayout;
+  barrier.newLayout = vk::ImageLayout::eTransferSrcOptimal;
+  const bool present = originalLayout == vk::ImageLayout::ePresentSrcKHR;
+  barrier.srcAccessMask =
+      present ? vk::AccessFlagBits::eColorAttachmentWrite
+              : vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+  barrier.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+  cb.pipelineBarrier(present ? vk::PipelineStageFlagBits::eColorAttachmentOutput
+                             : vk::PipelineStageFlagBits::eAllCommands,
+                     vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 0, nullptr, 1, &barrier);
+  vk::BufferImageCopy region{};
+  region.imageSubresource = {aspect, 0, layer, 1};
+  region.imageExtent = vk::Extent3D{extent.width, extent.height, 1};
+  cb.copyImageToBuffer(source, vk::ImageLayout::eTransferSrcOptimal, destination, region);
+  vk::BufferMemoryBarrier hostRead{};
+  hostRead.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  hostRead.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  hostRead.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+  hostRead.dstAccessMask = vk::AccessFlagBits::eHostRead;
+  hostRead.buffer = destination;
+  hostRead.offset = 0;
+  hostRead.size = VK_WHOLE_SIZE;
+  cb.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 0,
+                     nullptr, 1, &hostRead, 0, nullptr);
+  std::swap(barrier.oldLayout, barrier.newLayout);
+  barrier.srcAccessMask = vk::AccessFlagBits::eTransferRead;
+  barrier.dstAccessMask = vk::AccessFlagBits::eMemoryRead;
+  cb.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                     present ? vk::PipelineStageFlagBits::eBottomOfPipe
+                             : vk::PipelineStageFlagBits::eAllCommands,
+                     {}, 0, nullptr, 0, nullptr, 1, &barrier);
+}
 
 } // namespace vkb
-
 
 #if defined(VKB_IMPL)
 namespace vkb {
