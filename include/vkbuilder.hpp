@@ -4215,8 +4215,7 @@ public:
     info.sharingMode = vk::SharingMode::eExclusive;
     info.queueFamilyIndexCount = 0;
     info.pQueueFamilyIndices = nullptr;
-    //info.initialLayout = hostImage ? vk::ImageLayout::ePreinitialized : vk::ImageLayout::eUndefined;
-    info.initialLayout = vk::ImageLayout::ePreinitialized;
+    info.initialLayout = hostImage ? vk::ImageLayout::ePreinitialized : vk::ImageLayout::eUndefined;
     create(device, info, vk::ImageViewType::eCube, vk::ImageAspectFlagBits::eColor, hostImage);
   }
 };
