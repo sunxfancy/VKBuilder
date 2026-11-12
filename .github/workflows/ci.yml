@@ -23,6 +23,7 @@ jobs:
             cmake \
             ninja-build \
             libvulkan-dev \
+            mesa-vulkan-drivers \
             libx11-dev \
             glslc
 
@@ -34,3 +35,13 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build --output-on-failure
+
+      - name: Depth-array sampling and attachment regression (Lavapipe)
+        run: |
+          set -euo pipefail
+          for icd in /usr/share/vulkan/icd.d/lvp_icd*.json; do
+            test -f "$icd"
+            export VK_ICD_FILENAMES="$icd"
+            ./build/image_view_test
+            break
+          done
