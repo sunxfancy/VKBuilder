@@ -4,6 +4,15 @@
 
 namespace vkb {
 namespace binding_detail {
+// SPIRV-Cross 1.3.239 (Ubuntu 24.04) predates this resource category.
+template <class Resources>
+inline auto hasPlainUniforms(const Resources& resources, int)
+    -> decltype(resources.gl_plain_uniforms.empty(), bool()) {
+  return !resources.gl_plain_uniforms.empty();
+}
+template <class Resources>
+inline bool hasPlainUniforms(const Resources&, long) { return false; }
+
 inline vk::ShaderStageFlagBits stage(spv::ExecutionModel model) {
   switch (model) {
     case spv::ExecutionModelVertex: return vk::ShaderStageFlagBits::eVertex;
@@ -100,7 +109,7 @@ inline BindingValidation reflectShaderBindings(ShaderBindingContract& destinatio
     if (!resources.storage_images.empty() || !resources.separate_images.empty() ||
         !resources.separate_samplers.empty() || !resources.subpass_inputs.empty() ||
         !resources.atomic_counters.empty() || !resources.acceleration_structures.empty() ||
-        !resources.shader_record_buffers.empty() || !resources.gl_plain_uniforms.empty())
+        !resources.shader_record_buffers.empty() || binding_detail::hasPlainUniforms(resources, 0))
       throw std::runtime_error("Only UBO, SSBO and combined sampled-image descriptors are supported");
     std::vector<ShaderBinding> bindings;
     auto add = [&](const auto& list, vk::DescriptorType descriptorType) {
