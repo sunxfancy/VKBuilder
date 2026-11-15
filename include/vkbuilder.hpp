@@ -1,6 +1,21 @@
 #pragma once
 #define VULKAN_HPP_DISPATCH_LOADER_DYNAMIC 1
+// Apple dependency libraries are built as Release. Keep Vulkan-Hpp's dispatcher
+// layout identical in Debug consumers; restore the caller's assertion policy.
+#if defined(__APPLE__) && !defined(NDEBUG)
+#include <cassert>
+#pragma push_macro("assert")
+#undef assert
+#define assert(...) ((void)0)
+#define NDEBUG 1
+#define VKB_RESTORE_DEBUG_ASSERT 1
+#endif
 #include <vulkan/vulkan.hpp>
+#if defined(VKB_RESTORE_DEBUG_ASSERT)
+#undef NDEBUG
+#pragma pop_macro("assert")
+#undef VKB_RESTORE_DEBUG_ASSERT
+#endif
 
 #if defined(VKB_ENABLE_VMA)
 #if !defined(VKB_VMA_HEADER)
@@ -4124,7 +4139,9 @@ public:
   }
 
 protected:
-  void create(vkb::Device& device, const vk::ImageCreateInfo &info, vk::ImageViewType viewType, vk::ImageAspectFlags aspectMask, bool hostImage) {
+  // viewUsage restricts the primary view without reducing the image's capabilities.
+  // A nonempty restriction requires Vulkan 1.1 or enabled VK_KHR_maintenance2.
+  void create(vkb::Device& device, const vk::ImageCreateInfo &info, vk::ImageViewType viewType, vk::ImageAspectFlags aspectMask, bool hostImage, vk::ImageUsageFlags viewUsage = {}) {
     this->device = &device;
     s.currentLayout = info.initialLayout;
     s.info = info;
@@ -4152,6 +4169,9 @@ protected:
       viewInfo.format = info.format;
       viewInfo.components = { vk::ComponentSwizzle::eR, vk::ComponentSwizzle::eG, vk::ComponentSwizzle::eB, vk::ComponentSwizzle::eA };
       viewInfo.subresourceRange = vk::ImageSubresourceRange{aspectMask, 0, info.mipLevels, 0, info.arrayLayers};
+      vk::ImageViewUsageCreateInfo usageInfo{};
+      usageInfo.usage = viewUsage;
+      if (viewUsage) viewInfo.pNext = &usageInfo;
       s.imageView = device->createImageViewUnique(viewInfo);
     }
   }
@@ -4320,7 +4340,8 @@ private:
   using GenericImage::sampled;
 };
 
-/// Depth 2D array (CSM cascades). Array view is for sampling; layer views are attachments.
+/// Depth 2D array (CSM cascades). Array view is sampling-only; layer views are attachments.
+/// Requires Vulkan 1.1 or enabled VK_KHR_maintenance2 for view usage restrictions.
 class DepthArrayImage : public GenericImage {
 public:
   DepthArrayImage() {}
@@ -4339,7 +4360,7 @@ public:
     info.usage |= vk::ImageUsageFlagBits::eTransferSrc;
     info.sharingMode = vk::SharingMode::eExclusive;
     info.initialLayout = vk::ImageLayout::eUndefined;
-    create(device, info, vk::ImageViewType::e2DArray, vk::ImageAspectFlagBits::eDepth, false);
+    create(device, info, vk::ImageViewType::e2DArray, vk::ImageAspectFlagBits::eDepth, false, vk::ImageUsageFlagBits::eSampled);
 
     layerViews.resize(layers);
     for (uint32_t i = 0; i < layers; ++i) {
