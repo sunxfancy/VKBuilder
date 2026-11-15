@@ -12,6 +12,9 @@ jobs:
   linux:
     name: Ubuntu 24.04
     runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        reflection: ['ON', 'OFF']
     steps:
       - uses: actions/checkout@v4
 
@@ -24,10 +27,11 @@ jobs:
             ninja-build \
             libvulkan-dev \
             libx11-dev \
-            glslc
+            glslc \
+            libspirv-cross-c-shared-dev
 
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DVKB_BUILD_REFLECTION_TESTS=${{ matrix.reflection }}
 
       - name: Build
         run: cmake --build build
