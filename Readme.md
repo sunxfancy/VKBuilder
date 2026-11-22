@@ -226,3 +226,8 @@ graph.execute();   // acquire -> record -> submit -> present
 详细设计（依赖推导、barrier 合并、并行录制模型、线程契约、限制与路线）见
 [`docs/framegraph.md`](docs/framegraph.md)。单元测试在 `test/framegraph/`，
 纯逻辑测试无需 GPU：`cmake --build <build> --target framegraph_test`。
+
+## Shader resource binding checks
+
+See [shader binding validation](docs/shader-bindings.md) for optional SPIR-V
+reflection, cross-stage/layout checks, and checked descriptor writes (C++17).
